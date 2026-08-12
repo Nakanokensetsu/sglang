@@ -728,6 +728,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    long_prefill_token_threshold: A[
+        int,
+        "For chunked prefill, the maximum number of prompt tokens a single request may prefill in one scheduled pass. Requests with a longer remaining prompt are prefilled in chunks of at most this size, so up to chunked_prefill_size // threshold requests can be mid-prefill concurrently instead of one long prompt monopolizing the prefill budget. 0 (default) disables the cap: a single request may consume the whole chunked_prefill_size budget. Mirrors vLLM's --long-prefill-token-threshold.",
+        NS("schedule"),
+    ] = 0
     prefill_decode_interval: A[
         int,
         "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
@@ -3782,6 +3787,20 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
+
+    def _handle_long_prefill_token_threshold(self):
+        if self.long_prefill_token_threshold < 0:
+            raise ValueError(
+                "--long-prefill-token-threshold must be >= 0, got "
+                f"{self.long_prefill_token_threshold}."
+            )
+        if self.long_prefill_token_threshold > 0 and (
+            self.chunked_prefill_size is None or self.chunked_prefill_size <= 0
+        ):
+            raise ValueError(
+                "--long-prefill-token-threshold requires chunked prefill to be "
+                "enabled (chunked_prefill_size > 0)."
+            )
 
     # ===== END TO BE REFACTORED ====
 
