@@ -516,7 +516,10 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_req = None
+        # Requests this pass leaves mid-prefill. The scheduler carries them
+        # to the next pass; `chunked_reqs_in_batch` is the subset that actually
+        # got a chunk here (a parked request is in neither list's intersection).
+        self.new_chunked_reqs: List[Req] = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1173,7 +1176,7 @@ class PrefillAdder:
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            self.new_chunked_reqs.append(req)
             self._update_prefill_budget(
                 0,
                 trunc_len,
@@ -1185,8 +1188,18 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        num_chunked_reqs: int,
+        truncation_align_size: Optional[int],
     ):
+        """Admit one waiting request.
+
+        ``num_chunked_reqs`` is how many requests are already mid-prefill,
+        counting both those carried over from earlier passes and those this
+        pass has newly chunked. It bounds how many more may be left
+        mid-prefill; see ``max_concurrent_chunked_reqs``.
+        """
         # Nothing to prefill (fully cached); running a zero-token forward breaks
         # the one-output-per-request contract of the overlap scheduler.
         if len(req.full_untruncated_fill_ids) - len(req.prefix_indices) <= 0:
@@ -1403,7 +1416,7 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self.new_chunked_reqs.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
