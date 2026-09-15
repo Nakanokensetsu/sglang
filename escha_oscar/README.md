@@ -95,27 +95,118 @@ git clone https://huggingface.co/EschaLabs/Qwen3.6-35B-A3B-Escha-W2   # 12 GB
 
 The wheel installs a `sglang` package — that is the fork it serves with.
 
-### 3. Add OSCAR INT2 KV
+### 3. Add OSCAR INT2 KV (the long step)
 
-The wheel does **not** include it. Take the INT2 files from PR #32129 and drop
-them into the installed tree, then apply the patches in `patches/`:
+The wheel does **not** include it, and PR #32129 is **not a drop-in**. Two
+things get in the way:
+
+- The PR is written against upstream sglang's current layout, the wheel ships
+  an older one. The INT2 decode kernels live in
+  `python/sglang/kernels/ops/attention/decode_attention.py` in the PR and have
+  to land in `sglang/srt/layers/attention/triton_ops/decode_attention.py` in
+  the wheel. `git apply` will not do this for you.
+- Of the ten files involved, **six are files the escha fork has already
+  modified**. Overwriting them with the PR's copies breaks the runtime. They
+  have to be merged by hand.
+
+Budget an afternoon for this step. Everything below is the mapping that was
+actually used here, recovered by diffing the running installation against the
+untouched wheel.
+
+#### 3a. Pin the PR
+
+```bash
+git clone https://github.com/sgl-project/sglang.git sglang-pr32129
+cd sglang-pr32129
+git fetch origin pull/32129/head:oscar-int2-kv
+git checkout oscar-int2-kv
+# the mapping below was taken against 4b28b26bb4cca06984a97bacba25eb43cfd44145
+```
+
+#### 3b. Copy the four files that are genuinely new
+
+These do not exist in the wheel, so they can be copied verbatim. Source paths
+are relative to `sglang-pr32129/python/`, destinations to `$SP` (site-packages):
+
+| Copy from (PR) | To (wheel) |
+|---|---|
+| `sglang/QuantKernel/oscar_rotation_clip_int2_kv.py` | same path |
+| `sglang/srt/layers/attention/quantized_kv_prefill.py` | same path |
+| `sglang/srt/mem_cache/kv_quant_kernels.py` | same path |
+| `sglang/kernels/ops/attention/decode_attention.py` | **not copied** — see 3c |
+
+```bash
+SP=$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
+for f in sglang/QuantKernel/oscar_rotation_clip_int2_kv.py \
+         sglang/srt/layers/attention/quantized_kv_prefill.py \
+         sglang/srt/mem_cache/kv_quant_kernels.py; do
+    cp "python/$f" "$SP/$f"
+done
+```
+
+#### 3c. Merge the six files the escha fork already owns
+
+Sizes are the total delta of the running install against the stock wheel, so
+they include the patches applied in step 3e.
+
+| File | Δ lines | What has to come over from the PR |
+|---|---|---|
+| `srt/environ.py` | 12 | The env keys: `SGLANG_OSCAR_{K,V}_ROTATION_PATH`, `SGLANG_OSCAR_{K,V}_CLIP_RATIO`, `SGLANG_LLOYD_MAX` |
+| `srt/server_args.py` | 11 | `int2` added to the `--kv-cache-dtype` choices, plus the new `--kv-cache-quant-group-size` argument and its `kv_cache_quant_group_size` field |
+| `srt/model_executor/model_runner.py` | 5 | The `kv_cache_dtype == "int2"` branch that selects the INT2 pool |
+| `srt/model_executor/model_runner_kv_cache_mixin.py` | 52 | INT2 branches in KV-pool construction; threading `kv_cache_quant_group_size` through to the pool |
+| `srt/mem_cache/memory_pool.py` | 411 | `OscarRotationConfig`, `load_oscar_rotation_config()`, `load_oscar_rotations()`, `_resolve_quant_grouping()`, the scale/zero buffers (`_allocate_scales_zeros_buffers`, `get_{key,value}_scales_zeros`, `get_raw_{key,value}_buffer`, `get_oscar_rotation`) and the `dtype == "int2"` allocation path |
+| `srt/layers/attention/triton_backend.py` | 292 | `_forward_extend_int2()` and its dispatch (`is_int2 = getattr(kv_pool, "dtype", None) == "int2"`), `_apply_oscar_rotation`, `apply_inverse_v_rotation` |
+| `srt/layers/attention/triton_ops/decode_attention.py` | 1494 | The INT2 decode kernels, taken from the PR's `kernels/ops/attention/decode_attention.py`: `_fwd_kernel_stage1_quant_int2`, `_fwd_grouped_kernel_stage1_quant_int2`, `_decode_att_m_fwd_quant_int2`, `_decode_grouped_att_m_fwd_quant_int2`, `decode_attention_fwd_normal_quant_int2`, `decode_attention_fwd_grouped_quant_int2`, plus `decode_attention_fwd_quantized` and the `_get_scale_group_size` / `_get_shared_kv_scale_group_size` helpers. The PR's `decode_attention_fwd_int2_unified` dispatcher is *not* needed — the wheel's `triton_backend.py` dispatches to the two entry points directly |
+
+The last one is the real work: the PR file sits in a different package, so its
+imports and the surrounding helper names have to be rewritten for the
+`srt/layers/attention/triton_ops/` tree rather than moved wholesale.
+
+#### 3d. What is deliberately *not* ported
+
+PR #32129 also touches `srt/mem_cache/kv_cache_dtype.py`,
+`srt/mem_cache/unified_kv_pool.py`, `srt/models/{qwen3,glm4_moe,utils}.py` and
+`QuantKernel/gpu_flush_int2.py`. The first two do not exist in the wheel's
+tree, the model files are not needed for Escha-W2, and the data-free Hadamard
+*fallback* inside the pool was not ported either — which is why both rotation
+paths below are mandatory rather than optional.
+
+#### 3e. Apply the patches in `patches/`
+
+These sit on top of the integration above — they patch files that only exist
+once 3b/3c are done.
 
 ```bash
 SP=$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
 cd "$SP"
 for p in /path/to/escha_oscar/patches/*.patch; do
-    patch -p0 --backup --suffix=.orig < "$p"
+    patch -p1 --batch --backup --suffix=.orig < "$p"
 done
 ```
 
-You also need the rotation tensors OSCAR uses. Plain Hadamard is what is used
-here — see *Two results that went against expectation* for why the calibrated
-ones were dropped.
+> `-p1`, not `-p0`: the diff headers carry a `<site-packages>/` prefix that has
+> to be stripped. With `-p0` every patch reports *"can't find file to patch"*
+> and is silently skipped.
+
+#### 3f. Rotation tensors
+
+OSCAR needs a rotation checkpoint for K and for V. Uncalibrated (Hadamard)
+rotations are what is used here — see *Two results that went against
+expectation* for why the calibrated ones were dropped — and they need no
+calibration data, no GPU and no model weights:
 
 ```bash
-export SGLANG_OSCAR_K_ROTATION_PATH=/path/to/k_rotation_hadamard_hd256.pt
-export SGLANG_OSCAR_V_ROTATION_PATH=/path/to/v_rotation_hadamard_hd256.pt
+python /path/to/escha_oscar/tools/make_hadamard_rotations.py \
+    --head-dim 256 --num-layers 64 --out-dir /path/to/oscar_rotations
+
+export SGLANG_OSCAR_K_ROTATION_PATH=/path/to/oscar_rotations/k_rotation_hadamard_hd256.pt
+export SGLANG_OSCAR_V_ROTATION_PATH=/path/to/oscar_rotations/v_rotation_hadamard_hd256.pt
 ```
+
+(`--head-dim 256 --num-layers 64` are Escha-W2's; the script's output is
+bit-identical to the files in production here. Read `head_dim` and
+`num_hidden_layers` from the model's `config.json` for anything else.)
 
 > Patching `site-packages` is undone by any wheel reinstall. Keep the `.orig`
 > backups, or put the modified files on `PYTHONPATH` as an overlay instead of
@@ -162,6 +253,29 @@ curl -s http://127.0.0.1:8081/v1/chat/completions \
        "messages":[{"role":"user","content":"What is 1+1?"}],
        "max_tokens":64}' | python -m json.tool
 ```
+
+A reply only proves the server is up — it does not prove the INT2 path is the
+one being used. Two things to confirm:
+
+- the startup log line above says `K size: 0.21 GB, V size: 0.21 GB`. An
+  unquantized pool at this context is an order of magnitude larger, so a
+  gigabyte-scale figure here means `--kv-cache-dtype int2` silently fell back.
+- the integration is loaded at all (run it with the step 3f exports set):
+
+```bash
+python - <<'EOF'
+from sglang.srt.mem_cache.memory_pool import load_oscar_rotation_config
+from sglang.srt.layers.attention.triton_ops.decode_attention import (
+    decode_attention_fwd_grouped_quant_int2,
+)
+print("OSCAR INT2 present:", load_oscar_rotation_config())
+EOF
+```
+
+An `ImportError` here means step 3b/3c is incomplete. A `ValueError` naming
+`SGLANG_OSCAR_K_ROTATION_PATH` means the integration is fine but step 3f's
+exports are missing from the environment — the data-free Hadamard fallback was
+not ported, so the server will refuse to start the same way.
 
 ---
 
