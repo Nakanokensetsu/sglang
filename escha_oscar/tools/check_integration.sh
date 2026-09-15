@@ -9,6 +9,15 @@ chk() {  # chk <説明> <ファイル> <探す文字列>
     printf "NG   %-46s (%s に %s が無い)\n" "$1" "$2" "$3"; ng=1
   fi
 }
+if [ -f "$SP/sglang/QuantKernel/__init__.py" ]; then
+  if [ -s "$SP/sglang/QuantKernel/__init__.py" ]; then
+    printf "NG   QuantKernel/__init__.py が空ではない (PR側のものを入れると ImportError)\n"; ng=1
+  else
+    printf "OK   QuantKernel/__init__.py (空)\n"
+  fi
+else
+  printf "NG   QuantKernel/__init__.py が無い (mkdir -p + 空ファイルが必要)\n"; ng=1
+fi
 for f in QuantKernel/oscar_rotation_clip_int2_kv.py \
          srt/layers/attention/quantized_kv_prefill.py \
          srt/mem_cache/kv_quant_kernels.py; do

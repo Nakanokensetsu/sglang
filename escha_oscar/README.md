@@ -179,14 +179,26 @@ are relative to `sglang-pr32129/python/`, destinations to `$SP` (site-packages):
 | `sglang/srt/mem_cache/kv_quant_kernels.py` | same path |
 | `sglang/kernels/ops/attention/decode_attention.py` | **not copied** — see 3c |
 
+The `QuantKernel` package does not exist in the wheel at all, so create it
+first — with an **empty** `__init__.py`:
+
 ```bash
 SP=$(python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)")
+mkdir -p "$SP/sglang/QuantKernel"
+: > "$SP/sglang/QuantKernel/__init__.py"
+
 for f in sglang/QuantKernel/oscar_rotation_clip_int2_kv.py \
          sglang/srt/layers/attention/quantized_kv_prefill.py \
          sglang/srt/mem_cache/kv_quant_kernels.py; do
     cp "python/$f" "$SP/$f"
 done
+python -c "import sglang.QuantKernel.oscar_rotation_clip_int2_kv; print('import OK')"
 ```
+
+> Do **not** copy the PR's own `QuantKernel/__init__.py`. It imports
+> `fused_hadamard_int2_kv` and `gpu_flush_int2`, neither of which is ported
+> here, so it fails at import time. Both installations here carry a 0-byte
+> `__init__.py`.
 
 #### 3c. Merge the six files the escha fork already owns
 
@@ -210,8 +222,8 @@ imports and the surrounding helper names have to be rewritten for the
 #### 3d. What is deliberately *not* ported
 
 PR #32129 also touches `srt/mem_cache/kv_cache_dtype.py`,
-`srt/mem_cache/unified_kv_pool.py`, `srt/models/{qwen3,glm4_moe,utils}.py` and
-`QuantKernel/gpu_flush_int2.py`. The first two do not exist in the wheel's
+`srt/mem_cache/unified_kv_pool.py`, `srt/models/{qwen3,glm4_moe,utils}.py`,
+`QuantKernel/gpu_flush_int2.py` and `QuantKernel/fused_hadamard_int2_kv.py`. The first two do not exist in the wheel's
 tree, the model files are not needed for Escha-W2, and the data-free Hadamard
 *fallback* inside the pool was not ported either — which is why both rotation
 paths below are mandatory rather than optional.
