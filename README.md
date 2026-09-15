@@ -1,17 +1,24 @@
 > ### This fork: Escha-W2 (2-bit MoE) + OSCAR INT2 KV on 2× 12 GB
 >
-> Production patches and measurements for running **Qwen3.6-35B-A3B at 2-bit
-> weights** together with **OSCAR INT2 KV cache** on two 12 GB consumer GPUs —
-> 262 K context, 8 concurrent streams, 295 tok/s aggregate.
+> **A 35B model with a 262,144-token context, serving 8 concurrent users, on two
+> 12 GB consumer GPUs.**
 >
-> **→ [`escha_oscar/`](escha_oscar/README.md)**
+> | | |
+> |---|---|
+> | Model | [Qwen3.6-35B-A3B-Escha-W2](https://huggingface.co/EschaLabs/Qwen3.6-35B-A3B-Escha-W2) — 2-bit MoE, 256 experts, **12 GB on disk** |
+> | Runtime | [escha-runtime-qwen3moe](https://huggingface.co/EschaLabs/escha-runtime-qwen3moe) + [OSCAR INT2 KV (PR #32129)](https://github.com/sgl-project/sglang/pull/32129) |
+> | VRAM | 11.3 / 11.7 GB of 12.0 GB per card |
+> | Context | 262,144 · KV pool **350,257 tokens** · concurrency **12** |
+> | Speed | 87.5 → 56.8 tok/s single · **295 tok/s** at 8 concurrent · 180 K resend TTFT **1.87 s** |
 >
-> Highlights: INT2 prefill transient memory **−746 MB (−37 %)** at 192 K ·
-> worst inter-token gap during a long prefill **5.1 s → 0.14 s** ·
-> a silent grouped-decode head-tile bug that makes query heads read the wrong
-> KV head · calibrated rotations scored **worse** than Hadamard here (37/41 vs
-> 40/41) · the VRAM cliff at 11,830 MiB presents as slowness, not as an
-> allocation failure.
+> **→ [`escha_oscar/README.md`](escha_oscar/README.md)** — install steps you can
+> copy-paste, the flags you must not change and why, and the patches.
+>
+> Includes: INT2 prefill transient memory **−746 MB (−37 %)** · worst
+> inter-token gap during a long prefill **5.1 s → 0.14 s** · a silent
+> grouped-decode bug that makes query heads read the wrong KV head · calibrated
+> rotations scored **worse** than Hadamard here (37/41 vs 40/41) · the VRAM
+> cliff at 11,830 MiB presents as slowness, not as an allocation failure.
 >
 > Everything below is the upstream SGLang README.
 
