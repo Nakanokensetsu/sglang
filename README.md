@@ -1,3 +1,22 @@
+> ### This fork: Escha-W2 (2-bit MoE) + OSCAR INT2 KV on 2× 12 GB
+>
+> Production patches and measurements for running **Qwen3.6-35B-A3B at 2-bit
+> weights** together with **OSCAR INT2 KV cache** on two 12 GB consumer GPUs —
+> 262 K context, 8 concurrent streams, 295 tok/s aggregate.
+>
+> **→ [`escha_oscar/`](escha_oscar/README.md)**
+>
+> Highlights: INT2 prefill transient memory **−746 MB (−37 %)** at 192 K ·
+> worst inter-token gap during a long prefill **5.1 s → 0.14 s** ·
+> a silent grouped-decode head-tile bug that makes query heads read the wrong
+> KV head · calibrated rotations scored **worse** than Hadamard here (37/41 vs
+> 40/41) · the VRAM cliff at 11,830 MiB presents as slowness, not as an
+> allocation failure.
+>
+> Everything below is the upstream SGLang README.
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
