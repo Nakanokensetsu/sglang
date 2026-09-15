@@ -1,0 +1,78 @@
+--- <site-packages>/sglang/srt/layers/attention/triton_ops/decode_attention.py.bak-before-helpers-20260912-204329	2026-09-12 20:43:29.127016104 +0900
++++ <site-packages>/sglang/srt/layers/attention/triton_ops/decode_attention.py	2026-09-12 20:44:42.502350500 +0900
+@@ -36,6 +36,75 @@
+ _MIN_BLOCK_KV = 32
+ 
+ 
++def _safe_block_h(block_h: int, kv_group_num: int) -> int:
++    """Clamp a grouped-decode head tile so it never straddles a KV head.
++
++    ``_fwd_grouped_kernel_stage1`` and its INT2 twin address heads as
++
++        VALID_BLOCK_H = min(BLOCK_H, kv_group_num)
++        cur_head      = cur_head_id * VALID_BLOCK_H + arange(BLOCK_H)
++        cur_kv_head   = cur_head_id // cdiv(kv_group_num, BLOCK_H)
++
++    ``cur_head`` is a *flat* query-head index while ``cur_kv_head`` is derived
++    from the block index, so the two only agree when a head block lies wholly
++    inside one KV group -- that is, when ``BLOCK_H >= kv_group_num`` or
++    ``kv_group_num`` is a multiple of ``BLOCK_H``. (The launch grid
++    ``cdiv(q_head_num, VALID_BLOCK_H)`` is exact under the same condition.)
++
++    A hardcoded ``BLOCK_H = 16`` satisfies this for every power-of-two
++    ``kv_group_num``, which is why it has never bitten upstream. A tuned or
++    batch-size-dependent ``BLOCK_H`` does not: ``BLOCK_H=4`` against
++    ``kv_group_num=6`` (MiniMax-M2.7, 48 q heads / 8 KV heads at TP=4) makes
++    head block 1 cover q heads 4..7 while reporting ``cur_kv_head=0``, so q
++    heads 6 and 7 silently attend to KV head 0's cache. Nothing asserts, no
++    shape is wrong, and no NaN appears -- it only shows up as a benchmark
++    score.
++
++    Rounding up to a power of two keeps ``tl.arange(0, BLOCK_H)`` legal and
++    lands on ``VALID_BLOCK_H == kv_group_num``, i.e. one block per KV head.
++    """
++    if block_h < kv_group_num and kv_group_num % block_h != 0:
++        return triton.next_power_of_2(kv_group_num)
++    return block_h
++
++
++def _get_scale_group_size(head_dim: int, scales_zeros) -> int:
++    """Return the per-group head-dim span for quantized KV scales.
++
++    ``scales_zeros`` has last-dim layout ``[scale_0, zero_0, scale_1, zero_1, ...]``,
++    i.e. ``2 * num_groups`` entries. Returns ``head_dim // num_groups``; when the
++    cache uses a single scale/zero pair per head this equals ``head_dim``.
++    """
++    num_groups = scales_zeros.shape[-1] // 2
++    if head_dim % num_groups != 0:
++        raise ValueError(
++            f"head_dim ({head_dim}) must be divisible by quant scale groups ({num_groups})"
++        )
++    return head_dim // num_groups
++
++
++def _get_shared_kv_scale_group_size(
++    Lk: int, Lv: int, k_scales_zeros, v_scales_zeros
++) -> int:
++    """Return the shared configured INT2 KV group size.
++
++    K and V may have different head dims in MLA/DPE-style layouts, so the
++    scalar one-group case can report different per-tensor group sizes. Once
++    either side is actually grouped, the configured group size must match.
++    """
++    k_group_size = _get_scale_group_size(Lk, k_scales_zeros)
++    v_group_size = _get_scale_group_size(Lv, v_scales_zeros)
++    k_grouped = k_group_size < Lk
++    v_grouped = v_group_size < Lv
++
++    if (k_grouped or v_grouped) and k_group_size != v_group_size:
++        raise ValueError(
++            "INT2 KV cache requires K and V to use the same quant group size "
++            f"when grouped, got K={k_group_size}, V={v_group_size}"
++        )
++    return k_group_size if (k_grouped or v_grouped) else max(k_group_size, v_group_size)
++
++
+ @triton.jit
+ def tanh(x):
+     # Tanh is just a scaled sigmoid

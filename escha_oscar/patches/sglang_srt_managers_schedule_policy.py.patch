@@ -1,0 +1,17 @@
+--- <site-packages>/sglang/srt/managers/schedule_policy.py.bak-before-decodecap-20260915-075152	2026-09-12 21:33:35.582363100 +0900
++++ <site-packages>/sglang/srt/managers/schedule_policy.py	2026-09-15 07:51:52.310306725 +0900
+@@ -621,6 +621,14 @@
+                 # 待ちが解消した次のラウンドからは長文がフル予算に戻る。
+                 _fair = max(_reserve, int(os.environ.get("SGLANG_CHUNK_FAIR_FLOOR", "256")))
+                 chunk_budget = min(chunk_budget, _fair)
++            # 2026-09-15: escha(dense)から移植。decode中のストリームがいる間は
++            # チャンクを抑える。停止時間 = バッチ所要時間 = チャンク長 ÷ prefill速度
++            # なので、抑えると体感の「生成が止まる」が短くなる。
++            # 代償として長文prefillは他が生成中の間だけ遅くなる。
++            # 既定 0 = 無効(従来と完全に同一挙動)。SGLANG_CHUNK_DECODE_CAP=1536 等で有効化。
++            _dcap = int(os.environ.get("SGLANG_CHUNK_DECODE_CAP", "0"))
++            if _dcap > 0 and getattr(self, "running_decode_count", 0) > 0:
++                chunk_budget = min(chunk_budget, _dcap)
+             _rem_tokens = min(chunk_budget, int(self.rem_total_tokens))
+             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.

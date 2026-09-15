@@ -1,0 +1,72 @@
+--- <site-packages>/sglang/srt/layers/attention/triton_backend.py.bak-before-outbuf-20260915-075040	2026-09-12 20:11:48.174604265 +0900
++++ <site-packages>/sglang/srt/layers/attention/triton_backend.py	2026-09-15 07:51:17.168745673 +0900
+@@ -1071,38 +1071,45 @@
+             forward_batch.extend_prefix_lens[:bs],
+             cache_seqlens_cpu=prefix_lens_cpu,
+         )
+-        prefix_k, prefix_v = dequantize_prefix_kv(
+-            kv_pool, layer.layer_id, prefix_indices, kv_pool.model_dtype
+-        )
+-
+-        # Per-request concat of dequantized prefix + freshly rotated extend
+-        # K/V, and the matching cu_seqlens for the varlen call.
+-        k_parts: list[torch.Tensor] = []
+-        v_parts: list[torch.Tensor] = []
++        # 2026-09-15: escha(dense/0.5.15)から移植。一時メモリを P+E に抑える
++        # (旧実装は prefix展開 + 各リクエストcat + 全体cat で 3P+2E)。
++        # 連結後のバッファを先に1つだけ確保し、int2の履歴を**そのスライスへ直接展開**して、
++        # extend分をコピーで埋める。dequantize_kv_int2_triton は元から output の stride を
++        # 明示的に受け取るのでdim0スライスへ書ける(out= 引数を追加済み)。
++        # torch.cat を一切使わないので中間コピーが生まれない。
++        # denseの実測で -746MB。MoEは262Kとさらに長いので効果はより大きい。
+         cu_k = [0]
+         cu_q = [0]
++        total_k = 0
++        for p_len, e_len in zip(prefix_lens_cpu, extend_lens_cpu):
++            total_k += p_len + e_len
++            cu_k.append(total_k)
++            cu_q.append(cu_q[-1] + e_len)
++        combined_k = torch.empty(
++            (total_k, *k_r.shape[1:]), dtype=k_r.dtype, device=k_r.device
++        )
++        combined_v = torch.empty(
++            (total_k, *v_r.shape[1:]), dtype=v_r.dtype, device=v_r.device
++        )
+         p_off = 0
+         e_off = 0
++        dst = 0
+         for p_len, e_len in zip(prefix_lens_cpu, extend_lens_cpu):
+-            k_parts.append(
+-                torch.cat(
+-                    [prefix_k[p_off : p_off + p_len], k_r[e_off : e_off + e_len]],
+-                    dim=0,
+-                )
+-            )
+-            v_parts.append(
+-                torch.cat(
+-                    [prefix_v[p_off : p_off + p_len], v_r[e_off : e_off + e_len]],
+-                    dim=0,
++            if p_len:
++                dequantize_prefix_kv(
++                    kv_pool,
++                    layer.layer_id,
++                    prefix_indices[p_off : p_off + p_len],
++                    kv_pool.model_dtype,
++                    out_k=combined_k[dst : dst + p_len],
++                    out_v=combined_v[dst : dst + p_len],
+                 )
+-            )
++            if e_len:
++                combined_k[dst + p_len : dst + p_len + e_len] = k_r[e_off : e_off + e_len]
++                combined_v[dst + p_len : dst + p_len + e_len] = v_r[e_off : e_off + e_len]
+             p_off += p_len
+             e_off += e_len
+-            cu_k.append(cu_k[-1] + p_len + e_len)
+-            cu_q.append(cu_q[-1] + e_len)
+-
+-        combined_k = torch.cat(k_parts, dim=0)
+-        combined_v = torch.cat(v_parts, dim=0)
++            dst += p_len + e_len
+         q_for_fa = q_r.to(combined_k.dtype)
+         cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=self.device)
+         cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=self.device)

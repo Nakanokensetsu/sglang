@@ -1,0 +1,43 @@
+--- <site-packages>/sglang/srt/mem_cache/kv_quant_kernels.py.bak-before-outbuf-20260915-075040	2026-09-12 20:11:48.173023966 +0900
++++ <site-packages>/sglang/srt/mem_cache/kv_quant_kernels.py	2026-09-15 07:50:46.887171710 +0900
+@@ -2,6 +2,8 @@
+ Triton kernels for efficient INT2 KV cache quantization.
+ """
+ 
++from typing import Optional
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -532,13 +534,27 @@
+ def dequantize_kv_int2_triton(
+     quantized: torch.Tensor, scales_zeros: torch.Tensor,
+     head_dim: int, model_dtype: torch.dtype,
++    out: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+-    """Dequantize INT2 KV cache to ``model_dtype``."""
++    """Dequantize INT2 KV cache to ``model_dtype``.
++
++    2026-09-14: ``out`` を渡すと新規確保せずそこへ書き込む。カーネルは元から
++    ``output.stride()`` を明示的に受け取るので、連続確保した大きなバッファの
++    スライス(dim0方向)をそのまま渡せる。prefill経路で「展開 → cat」の
++    二重確保を避け、一時メモリを 2P+E から P+E へ下げるために追加した。
++    """
+     assert head_dim % 4 == 0
+     cache_size, num_heads, _ = quantized.shape
+-    output = torch.empty(
+-        (cache_size, num_heads, head_dim), dtype=model_dtype, device=quantized.device
+-    )
++    if out is None:
++        output = torch.empty(
++            (cache_size, num_heads, head_dim), dtype=model_dtype, device=quantized.device
++        )
++    else:
++        assert tuple(out.shape) == (cache_size, num_heads, head_dim), (
++            f"out shape {tuple(out.shape)} != {(cache_size, num_heads, head_dim)}"
++        )
++        assert out.dtype == model_dtype and out.device == quantized.device
++        output = out
+     grid = (cache_size, num_heads)
+     num_groups = _get_num_scale_groups(scales_zeros)
+ 

@@ -1,0 +1,34 @@
+--- <site-packages>/sglang/srt/managers/scheduler.py.bak-before-decodecap-20260915-075152	2026-09-12 21:33:27.186270138 +0900
++++ <site-packages>/sglang/srt/managers/scheduler.py	2026-09-15 07:52:23.368097924 +0900
+@@ -2082,6 +2082,18 @@
+             if dynamic_size is not None:
+                 chunked_prefill_size = dynamic_size
+ 
++        # 2026-09-15: escha(dense)から移植。decode中のストリームがいる間は
++        # チャンク長を抑える。停止時間 = バッチ所要時間 = チャンク長 ÷ prefill速度。
++        # ここ(adder生成時)で絞ると新規リクエストの初回チャンク(add_one_req)と
++        # 継続チャンク(add_chunked_req)の両方に効く。policy側だけに入れると
++        # 継続チャンクにしか掛からない(denseの実測で4.7秒の停止が残った)。
++        # 代償: 他が生成中の間だけ長文prefillが遅くなる。既定0=無効(従来と同一挙動)。
++        _dcap = int(os.environ.get("SGLANG_CHUNK_DECODE_CAP", "0"))
++        if _dcap > 0 and chunked_prefill_size:
++            _rb = getattr(self, "running_batch", None)
++            if len(getattr(_rb, "reqs", None) or ()) > 0:
++                chunked_prefill_size = min(chunked_prefill_size, _dcap)
++
+         # Prefill policy
+         adder = PrefillAdder(
+             self.page_size,
+@@ -2114,6 +2126,12 @@
+                 if self.waiting_queue
+                 else 0
+             )
++            # 2026-09-15: escha(dense)から移植。上の予約は「待機キュー(未受付)」しか
++            # 見ていないため、待機が空になるとチャンクがフルに戻り、そのバッチ所要時間が
++            # そのまま decode 中ストリームのトークン間隔の空白になる。
++            # SGLANG_CHUNK_DECODE_CAP を設定すると policy 側でチャンクを抑える。
++            _rb = getattr(self, "running_batch", None)
++            adder.running_decode_count = len(getattr(_rb, "reqs", None) or ()) if _rb else 0
+             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+ 
+         if self.enable_lora:

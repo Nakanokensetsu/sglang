@@ -1,0 +1,33 @@
+--- <site-packages>/sglang/srt/layers/attention/quantized_kv_prefill.py.bak-before-outbuf-20260915-075040	2026-09-12 20:11:48.173818171 +0900
++++ <site-packages>/sglang/srt/layers/attention/quantized_kv_prefill.py	2026-09-15 07:50:46.888343957 +0900
+@@ -131,6 +131,8 @@
+     layer_id: int,
+     prefix_indices: torch.Tensor,
+     model_dtype: torch.dtype,
++    out_k: Optional[torch.Tensor] = None,
++    out_v: Optional[torch.Tensor] = None,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     """Dequantize the prefix slots referenced by ``prefix_indices`` into dense
+     ``[num_tokens, head_num, head_dim]`` tensors in ``model_dtype``.
+@@ -151,6 +153,8 @@
+         l_head_dim = kv_pool.head_dim
+         l_v_head_dim = kv_pool.v_head_dim
+     if prefix_indices.numel() == 0:
++        if out_k is not None and out_v is not None:
++            return out_k, out_v
+         return (
+             torch.empty(
+                 (0, l_head_num, l_head_dim),
+@@ -172,9 +176,10 @@
+     assert kv_pool.dtype == "int2", (
+         f"Unsupported quantized KV dtype: {kv_pool.dtype}"
+     )
++    # 2026-09-14: out_k/out_v が渡されたら新規確保せずそこへ直接展開する
+     return (
+-        dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype),
+-        dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype),
++        dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype, out=out_k),
++        dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype, out=out_v),
+     )
+ 
+ 
