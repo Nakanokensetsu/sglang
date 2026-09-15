@@ -11,12 +11,20 @@ Format (what the runtime loads):
 
     {"layers": {layer_idx: {"rotation": float32 [head_dim, head_dim]}, ...}}
 
-Usage (Qwen3.6-35B-A3B-Escha-W2: 64 layers, head_dim 256):
+Usage -- point it at the model's config.json and it reads the shape itself:
 
-    python make_hadamard_rotations.py --out-dir /path/to/oscar_rotations
+    python make_hadamard_rotations.py \
+        --config /path/to/Qwen3.6-35B-A3B-Escha-W2/config.json \
+        --out-dir /path/to/oscar_rotations
 
-Read head_dim and num_hidden_layers from the model's config.json if your
-checkpoint differs.
+Or state the two numbers by hand (head_dim, then num_hidden_layers):
+
+    python make_hadamard_rotations.py --head-dim 256 --num-layers 40 \
+        --out-dir /path/to/oscar_rotations
+
+Only full-attention layers ever consume a rotation, and lookups are by layer
+index, so generating an entry for every layer is correct and generating too
+many is harmless.
 """
 import argparse
 import math
@@ -39,10 +47,23 @@ def hadamard(n: int) -> torch.Tensor:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--head-dim", type=int, default=256)
-    ap.add_argument("--num-layers", type=int, default=64)
+    ap.add_argument("--config", help="path to the model's config.json")
+    ap.add_argument("--head-dim", type=int)
+    ap.add_argument("--num-layers", type=int)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
+
+    if args.config:
+        import json
+
+        cfg = json.loads(pathlib.Path(args.config).read_text())
+        # Escha-W2 checkpoints keep the language model under "text_config".
+        cfg = cfg.get("text_config", cfg)
+        args.head_dim = args.head_dim or cfg["head_dim"]
+        args.num_layers = args.num_layers or cfg["num_hidden_layers"]
+    if not args.head_dim or not args.num_layers:
+        ap.error("give --config, or both --head-dim and --num-layers")
+    print(f"head_dim={args.head_dim} num_layers={args.num_layers}")
 
     rot = (hadamard(args.head_dim) / math.sqrt(args.head_dim)).to(torch.float32)
     err = (rot @ rot.T - torch.eye(args.head_dim)).abs().max().item()

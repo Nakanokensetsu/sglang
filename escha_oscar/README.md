@@ -73,6 +73,31 @@ Links you will need:
 - Runtime — [EschaLabs/escha-runtime-qwen3moe](https://huggingface.co/EschaLabs/escha-runtime-qwen3moe) (the wheel, `serve.sh` and `thinking_budget.py` live here)
 - OSCAR INT2 KV — [sglang PR #32129](https://github.com/sgl-project/sglang/pull/32129)
 
+### What you are signing up for
+
+Steps 1, 2, 4 and 5 are ordinary installation and take about half an hour.
+**Step 3 is a manual source merge and is most of an afternoon** — the two
+projects do not fit together on their own, and no script can do it for you.
+Nothing below needs CUDA-kernel experience, but you do need to be comfortable
+reading a diff and moving functions between files.
+
+Hardware and software this was done on:
+
+| | |
+|---|---|
+| GPUs | 2 × 12 GB, compute capability 12.0 (Blackwell, RTX 50-series) |
+| Disk | ~15 GB for the model, plus a checkout of sglang |
+| Python | CPython **3.12** — the wheel is `cp312` only |
+| glibc | ≥ 2.28 (`manylinux_2_28`) |
+| CUDA toolkit | not needed; `ptxas` ships inside `triton` |
+| OS | WSL2 / Ubuntu (plain Linux is fine; the `LD_LIBRARY_PATH` line in step 4 is WSL-specific) |
+
+Less VRAM than 24 GB total will not fit this configuration. More is fine, and
+makes the tuning in *Settings you must not change* less critical.
+
+Work through the steps in order. Each one ends with something to check, and a
+short list of what it means when that check fails.
+
 ### 1. Environment
 
 The wheel is built for **CPython 3.12** (`cp312`, `manylinux_2_28`). You need
@@ -82,7 +107,12 @@ glibc ≥ 2.28 and an NVIDIA driver — no CUDA toolkit (`ptxas` ships inside
 ```bash
 micromamba create -n eschamoe python=3.12 -y     # or conda/venv
 micromamba activate eschamoe
+python -c "import sys; print(sys.version)"       # must start with 3.12
 ```
+
+Keep this environment for the runtime alone. The wheel installs a package
+called `sglang` that is *not* upstream sglang, so anything else in the same
+environment that expects upstream sglang will break.
 
 ### 2. Runtime and model
 
@@ -93,7 +123,21 @@ pip install escha-runtime-qwen3moe/sglang/escha-1.0.2+qwen3moe-cp312-cp312-manyl
 git clone https://huggingface.co/EschaLabs/Qwen3.6-35B-A3B-Escha-W2   # 12 GB
 ```
 
-The wheel installs a `sglang` package — that is the fork it serves with.
+The wheel installs a `sglang` package — that is the fork it serves with. Do
+**not** also `pip install sglang`; the two overwrite each other.
+
+Check it imported, and remember where it landed — every path in step 3 is
+relative to this directory:
+
+```bash
+python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent.parent)"
+# -> /path/to/env/lib/python3.12/site-packages
+```
+
+| If this fails | Cause |
+|---|---|
+| `ERROR: ... not a supported wheel on this platform` | Not CPython 3.12, or glibc < 2.28 |
+| `ImportError` mentioning `libcuda`/`libnvidia` | Driver not visible yet. It is worth continuing — step 4 sets `LD_LIBRARY_PATH` |
 
 ### 3. Add OSCAR INT2 KV (the long step)
 
@@ -189,6 +233,19 @@ done
 > to be stripped. With `-p0` every patch reports *"can't find file to patch"*
 > and is silently skipped.
 
+Expect six lines of `patching file ...` and nothing else. What the other
+outcomes mean:
+
+| Output | Meaning |
+|---|---|
+| `can't find file to patch` | Wrong directory, or `-p0`. `cd "$SP"` first |
+| `Hunk #1 FAILED` on `quantized_kv_prefill.py` / `kv_quant_kernels.py` | Step 3b did not copy the PR's version of that file |
+| `Hunk #1 FAILED` on `triton_backend.py` / `decode_attention.py` | Step 3c's merge differs from the one here — apply that hunk by hand, it is small |
+| `Reversed (or previously applied) patch detected` | Already applied. Answer `n` |
+
+Add `--dry-run` first if you want to see the verdict without touching
+anything.
+
 #### 3f. Rotation tensors
 
 OSCAR needs a rotation checkpoint for K and for V. Uncalibrated (Hadamard)
@@ -198,15 +255,30 @@ calibration data, no GPU and no model weights:
 
 ```bash
 python /path/to/escha_oscar/tools/make_hadamard_rotations.py \
-    --head-dim 256 --num-layers 64 --out-dir /path/to/oscar_rotations
+    --config /path/to/Qwen3.6-35B-A3B-Escha-W2/config.json \
+    --out-dir /path/to/oscar_rotations
+# head_dim=256 num_layers=40
+# wrote /path/to/oscar_rotations/k_rotation_hadamard_hd256.pt
+# wrote /path/to/oscar_rotations/v_rotation_hadamard_hd256.pt
 
 export SGLANG_OSCAR_K_ROTATION_PATH=/path/to/oscar_rotations/k_rotation_hadamard_hd256.pt
 export SGLANG_OSCAR_V_ROTATION_PATH=/path/to/oscar_rotations/v_rotation_hadamard_hd256.pt
 ```
 
-(`--head-dim 256 --num-layers 64` are Escha-W2's; the script's output is
-bit-identical to the files in production here. Read `head_dim` and
-`num_hidden_layers` from the model's `config.json` for anything else.)
+The script reads `head_dim` and `num_hidden_layers` out of `config.json` (they
+live under `text_config` in these checkpoints — 256 and 40 for this MoE). Its
+output is bit-identical to the rotation files in production here.
+
+Two things that look wrong but are not:
+
+- **One entry per layer, but only some layers use it.** This is a hybrid
+  model: `config.json`'s `layer_types` marks only every fourth layer as
+  `full_attention` (10 of 40 here), and only those have a KV cache to rotate.
+  Lookups are by layer index, so generating all 40 is correct and generating
+  more than needed is harmless — the file in production here carries 64.
+- **Every layer gets the same matrix.** Uncalibrated rotations are
+  layer-independent by construction. Calibrated ones differ per layer, which
+  is the only visible difference between the two kinds of file.
 
 > Patching `site-packages` is undone by any wheel reinstall. Keep the `.orig`
 > backups, or put the modified files on `PYTHONPATH` as an overlay instead of
@@ -243,6 +315,17 @@ Startup takes about 33 s. You should see:
 KV Cache is allocated. #tokens: 350257, K size: 0.21 GB, V size: 0.21 GB
 max_total_num_tokens=350257, ... max_running_requests=12, context_len=262144
 ```
+
+If it does not start:
+
+| Symptom | Cause |
+|---|---|
+| `ValueError: Oscar int2 KV cache requires both SGLANG_OSCAR_..._ROTATION_PATH` | Step 3f's exports are missing from *this* shell (or from the systemd unit, if you run it as a service) |
+| CUDA OOM while loading weights | `--ep-size 2` missing — see *Settings you must not change* |
+| An assertion inside flashinfer | `ATTN_BACKEND=triton` missing on an RTX 50-series card |
+| `CUDA error: invalid configuration argument` | `--enable-mixed-chunk` is set. It cannot be used with the INT2 kernels |
+| `K size` in the log is gigabytes | `--kv-cache-dtype int2` did not take effect — the integration is incomplete |
+| Starts, then everything crawls at 100 % GPU and 40–50 W | The VRAM cliff. Lower `MEM` |
 
 ### 5. Check it
 
@@ -345,6 +428,50 @@ discriminating test needed many similar distractors, aggregation across
 positions, and ordered enumeration.
 
 ---
+
+## Doing the same on Qwen3.8-27B (the dense Escha-W2)
+
+The dense sibling — `Qwen3.8-27B-Escha-W2`, served by the
+`escha-runtime-qwen3dense` wheel — is also run here with OSCAR INT2 KV, at
+196,608 tokens on the same two 12 GB cards. **The step 3 integration is the
+same job on the same ten files**, so the mapping above transfers. What does
+not transfer:
+
+| | MoE (this document) | Dense Qwen3.8-27B |
+|---|---|---|
+| Wheel | `escha-1.0.2+qwen3moe` | `escha-1.2.1+qwen3dense` |
+| Layers / head_dim | 40 / 256 | 64 / 256 |
+| Full-attention layers | 10 (every 4th) | 16 (every 4th) |
+| Heads per GPU at TP 2 | 8 q / 1 kv → `kv_group_num` 8 | 12 q / 2 kv → `kv_group_num` **6** |
+| Rotations in production | uncalibrated (Hadamard) | **calibrated**, per layer |
+| KV quant group size | `--kv-cache-quant-group-size 32` | `64` |
+| Expert parallelism | `--ep-size 2` required | not applicable |
+| `--enable-mixed-chunk` | crashes with the INT2 kernels | works, and is used |
+| Context | 262,144 | 196,608 |
+
+Three consequences worth knowing before you start:
+
+- **The patches in `patches/` are cut against the MoE wheel.** Dry-run against
+  the dense tree, three of the six do not apply (`triton_backend`,
+  `schedule_policy`, and the second hunk of `scheduler`); `decode_attention`
+  only applies with fuzz. The *changes* are the right ones for both — the
+  context lines are not. Port them by hand and re-measure rather than forcing
+  them.
+- **`_safe_block_h` matters much more here.** At TP 2 the dense model has
+  `kv_group_num = 6`, which is neither ≥ `BLOCK_H` nor a multiple of it — the
+  exact shape that makes a head tile straddle a KV head. The MoE's group of 8
+  is a power of two, so it stays safe whatever `BLOCK_H` is.
+- **Do not copy the rotation choice across.** Uncalibrated rotations won the
+  measurement on the MoE checkpoint; the dense deployment runs calibrated
+  ones. Which wins is a property of the checkpoint, so generate the Hadamard
+  pair with the tool above, and only invest in calibration if a test that can
+  actually discriminate says it helps.
+
+Otherwise the launch differs only in the flags: `--tp-size 2` without
+`--ep-size`, `--kv-cache-quant-group-size 64`,
+`--triton-attention-num-kv-splits 64` (the default of 8 caps the dynamic split
+count and costs ~8 % on long-context decode), `--mamba-ssm-dtype float16`, and
+`CTXLEN=196608 MEM=0.87 CHUNK=6144 MAXREQ=12 MAXMAMBA=40`.
 
 ## Licence
 
