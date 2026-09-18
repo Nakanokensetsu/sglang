@@ -1,0 +1,135 @@
+# .bak が残っていない3ファイルの変更箇所(手マージ用)
+# 2026-09-18 時点の実機から抽出。前後3行付き。
+
+########## srt/server_args.py ##########
+611-                "nvfp4",
+612-                "fp4_mx_block16",
+613-                "fp4_e2m1",
+614:                # 2026-09-18 自前移植: OSCAR int2 量子化KV(Escha-W2用)
+615-                "int2",
+616-            ],
+617-            resolvable=True,
+618-        ),
+619-        NS("model"),
+620-    ] = "auto"
+621-    kv_cache_quant_group_size: A[
+622-        Optional[int],
+623-        (
+624-            "Group size (along head_dim) for --kv-cache-dtype int2 quantization. "
+625-            "Defaults to head_dim (one group per head) when unset. "
+626:            "(2026-09-18 自前移植: OSCAR int2)"
+627-        ),
+628-        NS("model"),
+629-    ] = None
+630-    enable_fp32_lm_head: A[
+631-        bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
+632-    ] = False
+633-    modelopt_quant: A[
+634-        Optional[Union[str, Dict]],
+
+########## srt/models/qwen3_5.py ##########
+1802-
+1803-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+1804-        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+1805:        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+1806-        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+1807-        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+1808-        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+1809-        # モデル dtype(fp16)へ揃える。
+1810-        weights = [
+1811-            (_n, _w.to(torch.float16)
+1812-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+1813-            for _n, _w in weights
+1814-        ]
+1815:        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+1816-        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+1817-        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+1818-        # 出力が一様ロジット("!!!!" のゴミ)になる。
+1819-        weights = list(weights)
+1820-        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+1821-            _ibuf, _iout = {}, []
+1822-            for _n, _w in weights:
+1823-                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+--
+1919-
+1920-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+1921-        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+1922:        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+1923-        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+1924-        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+1925-        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+1926-        # モデル dtype(fp16)へ揃える。
+1927-        weights = [
+1928-            (_n, _w.to(torch.float16)
+1929-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+1930-            for _n, _w in weights
+1931-        ]
+1932:        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+1933-        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+1934-        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+1935-        # 出力が一様ロジット("!!!!" のゴミ)になる。
+1936-        weights = list(weights)
+1937-        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+1938-            _ibuf, _iout = {}, []
+1939-            for _n, _w in weights:
+1940-                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+--
+2213-
+2214-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+2215-        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+2216:        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+2217-        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+2218-        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+2219-        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+2220-        # モデル dtype(fp16)へ揃える。
+2221-        weights = [
+2222-            (_n, _w.to(torch.float16)
+2223-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+2224-            for _n, _w in weights
+2225-        ]
+2226:        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+2227-        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+2228-        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+2229-        # 出力が一様ロジット("!!!!" のゴミ)になる。
+2230-        weights = list(weights)
+2231-        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+2232-            _ibuf, _iout = {}, []
+2233-            for _n, _w in weights:
+2234-                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+--
+2411-
+2412-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+2413-        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+2414:        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+2415-        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+2416-        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+2417-        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+2418-        # モデル dtype(fp16)へ揃える。
+2419-        weights = [
+2420-            (_n, _w.to(torch.float16)
+2421-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+2422-            for _n, _w in weights
+2423-        ]
+2424:        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+2425-        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+2426-        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+2427-        # 出力が一様ロジット("!!!!" のゴミ)になる。
+2428-        weights = list(weights)
+2429-        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+2430-            _ibuf, _iout = {}, []
+2431-            for _n, _w in weights:
+2432-                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+
+########## srt/layers/quantization/__init__.py ##########
+76-    from sglang.srt.layers.moe.topk import TopKOutput
+77-
+78-# Base quantization methods
+79:# 2026-09-18 自前移植: escha 2bit量子化(escha 1.2.2 wheel 由来)
+80-from sglang.srt.layers.quantization.escha import DIEschaConfig
+81-from sglang.srt.layers.quantization.eschamoe import DIEschaMoEConfig
+82-
+83-BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
+84-    "escha": DIEschaConfig,
+85-    "eschamoe": DIEschaMoEConfig,
+86-    "fp8": Fp8Config,
+87-    "mxfp8": Fp8Config,

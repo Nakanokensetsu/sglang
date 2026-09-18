@@ -1,0 +1,17 @@
+--- srt/environ.py.bak	2026-09-18 06:39:08.794896354 +0900
++++ srt/environ.py	2026-09-18 06:39:08.812385337 +0900
+@@ -1642,6 +1642,14 @@
+         "/tmp/sglang_weight_cache_{device_uuid}.ready"
+     )
+ 
++    # 2026-09-18 自前移植: OSCAR int2 KV cache (FutureMLS-Lab/OSCAR 由来)。
++    # 回転行列のパスは --kv-cache-dtype int2 使用時は必須(Hadamard フォールバックは未移植)。
++    SGLANG_OSCAR_K_ROTATION_PATH = EnvStr("")
++    SGLANG_OSCAR_V_ROTATION_PATH = EnvStr("")
++    SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
++    SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
++    SGLANG_LLOYD_MAX = EnvBool(False)
++
+ 
+ envs = Envs()
+ EnvField._allow_set_name = False

@@ -1,0 +1,13 @@
+--- srt/mem_cache/kv_cache_dtype.py.bak	2026-09-18 06:28:41.628670136 +0900
++++ srt/mem_cache/kv_cache_dtype.py	2026-09-18 06:28:41.647314858 +0900
+@@ -77,6 +77,10 @@
+                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
+                 "with CUDA 12.8+."
+             )
++    elif server_args_kv_cache_dtype == "int2":
++        # 2026-09-18 自前移植: OSCAR int2 量子化KV。torch の dtype ではなく
++        # 文字列 "int2" のまま保持し、MHATokenToKVPool 側が明示的に分岐する。
++        kv_cache_dtype = "int2"
+     else:
+         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
+ 

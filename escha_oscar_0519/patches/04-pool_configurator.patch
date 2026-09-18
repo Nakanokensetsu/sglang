@@ -1,0 +1,36 @@
+--- srt/model_executor/pool_configurator.py.bak2	2026-09-18 06:48:46.293164513 +0900
++++ srt/model_executor/pool_configurator.py	2026-09-18 06:48:55.075758858 +0900
+@@ -340,7 +340,7 @@
+             )
+             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
+             # cell_size is already a sum over heterogeneous sub-pools.
+-            return main_pool_bytes + indexer_bytes
++            return int(main_pool_bytes + indexer_bytes)
+         else:
+             n = model_config.get_num_kv_heads(tp_size, dcp_size)
+             cell_size = (
+@@ -365,7 +365,7 @@
+                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
+                 ) // scale_block_size
+ 
+-        return cell_size
++        return int(cell_size)
+ 
+     def _compute_dsa_indexer_cell_size(
+         self,
+@@ -438,13 +438,13 @@
+             if self._cell_size
+             else self._zero_kv_max_tokens
+         )
+-        max_total_num_tokens = max_total_num_tokens // page_size * page_size
++        max_total_num_tokens = int(max_total_num_tokens) // page_size * page_size
+         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+ 
+     def calculate_pool_sizes_from_max_tokens(
+         self, max_total_num_tokens: int, page_size: int
+     ) -> MemoryPoolConfig:
+-        max_total_num_tokens = max_total_num_tokens // page_size * page_size
++        max_total_num_tokens = int(max_total_num_tokens) // page_size * page_size
+         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+ 
+ 

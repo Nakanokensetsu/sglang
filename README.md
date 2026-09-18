@@ -20,6 +20,25 @@
 > rotations scored **worse** than Hadamard here (37/41 vs 40/41) · the VRAM
 > cliff at 11,830 MiB presents as slowness, not as an allocation failure.
 >
+> ---
+>
+> ### Also here: the same stack on **stock sglang 0.5.19**
+>
+> **→ [`escha_oscar_0519/README.md`](escha_oscar_0519/README.md)** — a 27B dense
+> hybrid-SSM (Qwen3.8-27B-Escha-W2) at **131 K context, 8 concurrent users**, on
+> unmodified upstream sglang 0.5.19 instead of the fork bundled in the wheel.
+>
+> Headline finding: 0.5.19's **new prefill CUDA graph captures 51 shapes and holds
+> 1.81 GB**, which starves INT2 KV's length-proportional dequant workspace.
+> `--disable-prefill-cuda-graph` takes 96 K prefill from **202 → 893 tok/s (4.4×)**
+> *and* makes short prompts 4-7 % faster. sglang has prefill-graph auto-disable
+> rules, but **none of them look at free VRAM**.
+>
+> Also: `--mamba-radix-cache-strategy extra_buffer_lazy` cuts mamba slots per
+> request from 5 to 4, lifting aggregate throughput **+32 % at 8 clients** at
+> identical VRAM · quality **19/20**, tied with the 0.5.15 stack on a
+> discriminative long-context test · 8 patches that apply with `patch -p0`.
+>
 > Everything below is the upstream SGLang README.
 
 ---

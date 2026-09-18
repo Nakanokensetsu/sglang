@@ -1,5 +1,11 @@
 # Escha-W2 (2-bit MoE) + OSCAR INT2 KV — production setup and patches
 
+> **New (2026-09-18):** there is now a second route that runs this stack on
+> **stock upstream sglang 0.5.19** instead of the fork bundled in the `escha`
+> wheel — see [`escha_oscar_0519/`](../escha_oscar_0519). It unlocks the newer
+> mamba/radix features, and documents a 1.81 GB VRAM regression caused by
+> 0.5.19's new prefill CUDA graph (96K prefill 202 -> 893 tok/s once disabled).
+
 **A 35B model with a 262,144-token context, serving 8 concurrent users, on two
 12 GB consumer GPUs.**
 

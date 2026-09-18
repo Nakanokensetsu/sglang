@@ -1,0 +1,119 @@
+--- srt/layers/quantization/escha.py.bak	2026-09-18 05:35:36.354730131 +0900
++++ srt/layers/quantization/escha.py	2026-09-18 05:56:19.630255899 +0900
+@@ -392,7 +392,7 @@
+             return self._slice(t, 0, r, s)
+         return t  # rin / s_in: IC not sharded on column-parallel
+ 
+-    def _split_fused_into_shards(self, t):
++    def _split_fused_into_shards(self, t, shard_ids=None):
+         """Fused-on-disk merged column linear: ONE checkpoint tensor for a layer that
+         declares num_shards>1 (GDN in_proj_qkv over [key, key, value]). Split by the
+         pre-TP sub-sizes, TP-slice each sub on OC, and fill _shards[i] separately so
+@@ -400,10 +400,20 @@
+         if t is None:
+             return
+         r, s = self._tp()
+-        sub = getattr(self._owner_layer, "_escha_pretp_output_partition_sizes", None)
+-        assert sub and len(sub) == self._num_shards, (
+-            f"fused merged linear: expected {self._num_shards} sub sizes, got {sub}"
+-        )
++        sub_all = getattr(self._owner_layer, "_escha_pretp_output_partition_sizes", None)
++        assert sub_all, "fused merged linear: no pretp output partition sizes"
++        # 2026-09-18 自前移植: sglang 0.5.19 は分離チェックポイントを融合レイヤへ読む際、
++        # どのシャードに入れるかを loaded_shard_id で指定する
++        #   ("in_proj_qkvz.", "in_proj_qkv.", (0,1,2))  ← q/k/v をシャード0,1,2へ
++        #   ("in_proj_qkvz.", "in_proj_z.",   3)        ← gate をシャード3へ
++        # よって「全シャード」ではなく**指定されたシャードだけ**を対象にする。
++        if shard_ids is None:
++            shard_ids = tuple(range(self._num_shards))
++            assert len(sub_all) == self._num_shards, (
++                f"fused merged linear: expected {self._num_shards} sub sizes, got {sub_all}"
++            )
++        sub = [sub_all[i] for i in shard_ids]
++        tgt = list(shard_ids)
+         if self._suffix == "escha_config":
+             assert int(t[5]) == sum(sub), (
+                 f"fused escha_config OC {int(t[5])} != sum(sub sizes) {sum(sub)}"
+@@ -412,15 +422,22 @@
+                 new = t.clone()
+                 assert ss % s == 0, f"sub size {ss} not divisible by tp {s}"
+                 new[5] = ss // s
+-                self._shards[i] = new
++                self._shards[tgt[i]] = new
+             return
+         if self._suffix == "escha_code":
++            # 2026-09-18 デバッグ: 0.5.19 で sub と実テンソルが食い違う件の調査
++            import os as _dbg_os
++            if _dbg_os.environ.get("ESCHA_DEBUG_SPLIT") == "1":
++                print(f"[ESCHA_SPLIT] layer={type(self._owner_layer).__name__} "
++                      f"suffix={self._suffix} sub={sub} num_shards={self._num_shards} "
++                      f"t.shape={tuple(t.shape)} expect_sum={sum(ss//16 for ss in sub)}",
++                      flush=True)
+             for i, p in enumerate(torch.split(t, [ss // 16 for ss in sub], dim=1)):
+-                self._shards[i] = self._slice(p, 1, r, s) if s > 1 else p.contiguous()
++                self._shards[tgt[i]] = self._slice(p, 1, r, s) if s > 1 else p.contiguous()
+             return
+         if self._suffix in ("escha_rout", "escha_s_out"):
+             for i, p in enumerate(torch.split(t, list(sub), dim=0)):
+-                self._shards[i] = self._slice(p, 0, r, s) if s > 1 else p.contiguous()
++                self._shards[tgt[i]] = self._slice(p, 0, r, s) if s > 1 else p.contiguous()
+             return
+         for i in range(self._num_shards):   # rin / s_in: IC-dim, replicated
+             self._shards[i] = t
+@@ -432,6 +449,13 @@
+         # num_shards=3) from the single fused shard the runtime ships with into a
+         # 3-shard layout, changing the launch grouping and the CUDA-graph shard
+         # signature. Gate on world size so single-GPU runs are bit-for-bit untouched.
++        # 2026-09-18 自前移植: sglang 0.5.19 は融合チェックポイントを読むとき
++        # loaded_shard_id にタプル (0,1,2) を渡す(0.5.15 には無い呼び方)。これは
++        # 「1つの融合テンソルを全シャードへ分割せよ」の意味なので None と同じ扱いにする。
++        if isinstance(loaded_shard_id, tuple):
++            # 指定された複数シャードへ分割して入れる(0.5.19 の分離チェックポイント対応)
++            param._split_fused_into_shards(loaded_weight, shard_ids=loaded_shard_id)
++            return
+         if param._tp()[1] > 1:
+             if (loaded_shard_id is None and param._num_shards > 1
+                     and not param._is_row_parallel
+@@ -441,7 +465,11 @@
+         idx = 0 if loaded_shard_id is None else param._shard_id_as_int(loaded_shard_id)
+         param._shards[idx] = param._shard_tp(loaded_weight)
+ 
+-    def _shard_id_as_int(self, shard_id: Union[str, int]) -> int:
++    def _shard_id_as_int(self, shard_id) -> int:
++        # 2026-09-18 自前移植: sglang 0.5.19 は融合チェックポイントを読むとき
++        # loaded_shard_id にタプル (0,1,2) を渡してくる(0.5.15 には無い呼び方)。
++        # escha 側は str("q"/"k"/"v") か int しか想定しておらず KeyError になる。
++        # タプルは「全シャードまとめて」の意味なので先頭を返す。
+         if isinstance(shard_id, int):
+             return shard_id
+         return self.qkv_idxs[shard_id]
+@@ -512,6 +540,12 @@
+         if isinstance(layer, LinearBase):
+             # Honor the export's ignore list (unquantized linears stay fp16).
+             ignore = set(self.full_config.get("ignore", []))
++            # 2026-09-18 自前移植: チェックポイントに escha_* を持たない層は非量子化。
++            # Escha-W2 の GDN では in_proj_a / in_proj_b が素の fp16 のまま焼かれている
++            # (quantize_config.json に ignore リストが無いのでコード側で判定する)。
++            # 0.5.15 のフォークはこれらを独立レイヤにして回避していたが、0.5.19 は
++            # in_proj_ba という融合レイヤを作るため、ここで弾かないとシャードが空になる。
++            ignore |= {"in_proj_a", "in_proj_b", "in_proj_ba"}
+             leaf = prefix.rsplit(".", 1)[-1] if prefix else ""
+             if leaf in ignore or prefix in ignore:
+                 from sglang.srt.layers.quantization.unquant import (
+@@ -976,6 +1010,16 @@
+             if _acc_prev is not None:
+                 torch.backends.cuda.matmul.allow_fp16_accumulation = _acc_prev
+ 
++        if not out_parts:
++            # 2026-09-18 デバッグ: どの層でシャードが空になるか特定する
++            import os as _d
++            if _d.environ.get("ESCHA_DEBUG_SPLIT") == "1":
++                _pfx = getattr(layer, "prefix", "?")
++                _cfgs = getattr(layer, "escha_shard_configs", None)
++                _code = getattr(layer, "escha_shard_code", None)
++                print(f"[ESCHA_EMPTY] prefix={_pfx} configs={_cfgs} "
++                      f"code_is_none={[c is None for c in (_code or [])]}", flush=True)
++            raise RuntimeError(f"escha: no shards built for layer {getattr(layer,'prefix','?')}")
+         out = torch.cat(out_parts, dim=-1) if len(out_parts) > 1 else out_parts[0]
+         out = out.reshape(orig_shape[:-1] + (out.shape[-1],))
+         if bias is not None:

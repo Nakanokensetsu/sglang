@@ -1,0 +1,214 @@
+--- srt/layers/attention/triton_backend.py.bak	2026-09-18 06:53:19.579523112 +0900
++++ srt/layers/attention/triton_backend.py	2026-09-18 09:37:07.060497764 +0900
+@@ -164,6 +164,8 @@
+             _LEAN_BLOCK_M,
+             _lean_decode_launch_params,
+             decode_attention_fwd,
++            # 2026-09-18 自前移植: OSCAR int2 のデコード経路
++            decode_attention_fwd_quantized,
+             lean_capture_policy,
+             lean_decode_seqlen_gate,
+         )
+@@ -182,6 +184,10 @@
+         super().__init__()
+ 
+         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
++        # 2026-09-18 自前移植: OSCAR int2 KV のデコード経路
++        self.decode_attention_fwd_quantized = torch.compiler.disable(
++            decode_attention_fwd_quantized
++        )
+         # Work-Centric (Lean) Attention activation. None => auto-gate from host-side
+         # seqlen metadata in forward_decode; True/False => explicit override.
+         self.enable_lean_attention = model_runner.server_args.enable_lean_attention
+@@ -1371,6 +1377,14 @@
+         elif k is None or v is None:
+             raise ValueError("Both k and v should be None or not None")
+         else:
++            # 2026-09-18 自前移植: OSCAR int2 はページ化 KV をカーネル内で読めない。
++            # 前置 prefix を dequant して dense に展開する専用経路へ抜ける。
++            if save_kv_cache and (
++                getattr(self.token_to_kv_pool, "dtype", None) == "int2"
++            ):
++                return self._forward_extend_int2(
++                    q, k, v, o, layer, forward_batch, sinks
++                )
+             # Save KV cache first (must do this before unified kernel)
+             if save_kv_cache:
+                 loc_info = KVWriteLoc(
+@@ -1677,6 +1691,110 @@
+         out = prefix_out * prefix_scale + current_out * current_scale
+         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+ 
++    def _forward_extend_int2(
++        self,
++        q: torch.Tensor,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        o: torch.Tensor,
++        layer: RadixAttention,
++        forward_batch: ForwardBatch,
++        sinks: Optional[torch.Tensor],
++    ):
++        """OSCAR int2 KV プールに対する prefill/extend。
++
++        2026-09-18 自前移植。本番 0.5.15 版は dequant した prefix と回転済み
++        extend K/V を連結して flash-attn(FA2) の varlen に渡していたが、この
++        環境(torch 2.13)には FA2 のプリビルド wheel が存在せず、同梱の FA4 は
++        SM120 を拒否する。代わりに sglang 自身の Triton extend カーネルへ、
++        dequant した prefix を「ページ番号が連番のページ表」として渡す。
++        リクエストごとの連結ループが不要になる分、本番版より軽い。
++        """
++        from sglang.srt.layers.attention.quantized_kv_prefill import (
++            apply_inverse_v_rotation,
++            build_prefix_indices_from_req_to_token,
++            dequantize_prefix_kv,
++            prepare_quantized_extend_qkv,
++        )
++
++        assert sinks is None, "int2 prefill は attention sink 未対応"
++        kv_pool = self.token_to_kv_pool
++        bs = forward_batch.batch_size
++        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
++
++        q_r, k_r, v_r, need_v_inverse = prepare_quantized_extend_qkv(
++            kv_pool, layer, q3, k, v
++        )
++        kv_pool.set_kv_buffer(
++            layer,
++            KVWriteLoc(
++                forward_batch.out_cache_loc,
++                self.forward_metadata.swa_out_cache_loc,
++                full_loc=self.forward_metadata.out_cache_loc_full_physical,
++            ),
++            k_r,
++            v_r,
++            already_hadamard_transformed=True,
++        )
++
++        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
++        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
++        prefix_indices = build_prefix_indices_from_req_to_token(
++            self.req_to_token,
++            forward_batch.req_pool_indices[:bs],
++            forward_batch.extend_prefix_lens[:bs],
++            cache_seqlens_cpu=prefix_lens_cpu,
++        )
++        model_dtype = kv_pool.model_dtype
++        prefix_k, prefix_v = dequantize_prefix_kv(
++            kv_pool, layer.layer_id, prefix_indices, model_dtype
++        )
++
++        # dequant 済み prefix はリクエスト順に詰まっているので、ページ表は
++        # そのまま連番 = arange でよい。
++        total_prefix = int(sum(prefix_lens_cpu))
++        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
++        kv_indptr[1:] = torch.cumsum(
++            torch.tensor(list(prefix_lens_cpu), dtype=torch.int32, device=self.device),
++            dim=0,
++        )
++        kv_indices = torch.arange(
++            total_prefix, dtype=torch.int32, device=self.device
++        )
++        qo_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
++        qo_indptr[1:] = torch.cumsum(
++            torch.tensor(list(extend_lens_cpu), dtype=torch.int32, device=self.device),
++            dim=0,
++        )
++
++        o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
++        out = torch.empty_like(o3, dtype=model_dtype)
++        self.extend_attention_fwd(
++            q_r.to(model_dtype).contiguous(),
++            k_r.to(model_dtype).contiguous(),
++            v_r.to(model_dtype).contiguous(),
++            out,
++            prefix_k.contiguous(),
++            prefix_v.contiguous(),
++            qo_indptr,
++            kv_indptr,
++            kv_indices,
++            None,
++            True,
++            None,
++            max(extend_lens_cpu),
++            1.0,
++            1.0,
++            sm_scale=layer.scaling,
++            logit_cap=logit_capping_mod(
++                layer.logit_capping_method, layer.logit_cap
++            ),
++        )
++
++        out = apply_inverse_v_rotation(out, kv_pool, layer, need_v_inverse)
++        o3.copy_(out.to(o3.dtype))
++        return o
++
+     def _forward_extend_unified(
+         self,
+         q: torch.Tensor,
+@@ -1898,6 +2016,65 @@
+             k_descale = 1.0
+             v_descale = 1.0
+ 
++        # ===== 2026-09-18 自前移植: OSCAR int2 のデコード経路 =====
++        # packed int2 をカーネル内で dequant する専用カーネルへ。Q には K 側の
++        # 回転を掛け、V 側の回転は出力に逆回転を掛けて戻す。
++        kv_pool = self.token_to_kv_pool
++        if getattr(kv_pool, "dtype", None) == "int2":
++            # 2026-09-18: この分岐は下の DCP 分岐より手前で return する。int2 の
++            # デコードカーネルは公式にある output_lse(rank 間の部分 attention 統合)
++            # を移植していないので、DCP 下では黙って誤った結果を返してしまう。
++            # 使う時が来たら公式の output_lse 版を移植すること。
++            if self.dcp_size > 1:
++                raise NotImplementedError(
++                    "int2 KV cache does not support decode context parallel "
++                    "(dcp_size>1): the ported int2 decode kernels lack the "
++                    "output_lse path needed to merge partial attention."
++                )
++            from sglang.srt.layers.attention.quantized_kv_prefill import (
++                _apply_oscar_rotation,
++            )
++
++            R_k, R_v = kv_pool.get_oscar_rotation(layer.layer_id)
++            q_for_decode = q.contiguous().view(
++                -1, layer.tp_q_head_num, layer.qk_head_dim
++            )
++            kv_group_num = (
++                q_for_decode.shape[1] // R_k.shape[0] if R_k.dim() == 3 else 1
++            )
++            q_for_decode = _apply_oscar_rotation(q_for_decode, R_k, kv_group_num)
++            self.decode_attention_fwd_quantized(
++                q_for_decode,
++                kv_pool.get_raw_key_buffer(layer.layer_id),
++                kv_pool.get_raw_value_buffer(layer.layer_id),
++                kv_pool.get_key_scales_zeros(layer.layer_id),
++                kv_pool.get_value_scales_zeros(layer.layer_id),
++                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
++                kv_indptr,
++                kv_indices,
++                self.forward_metadata.attn_logits,
++                self.forward_metadata.attn_lse,
++                self.forward_metadata.num_kv_splits,
++                self.max_kv_splits,
++                layer.scaling,
++                kv_pool.dtype,
++                logit_cap=logits_soft_cap,
++                sinks=sinks,
++                xai_temperature_len=layer.xai_temperature_len,
++            )
++            # V は常に回転済み -> 出力へ逆回転。
++            o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
++            if R_v.dim() == 2:
++                o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
++            else:
++                Rv_h = R_v.repeat_interleave(
++                    max(1, o3.shape[1] // R_v.shape[0]), dim=0
++                )
++                o3.copy_(
++                    torch.einsum("thd,hed->the", o3.to(R_v.dtype), Rv_h).to(o3.dtype)
++                )
++            return o
++
+         # Select the correctly-sized attn_logits buffer for this layer.
+         # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]
+         # to exactly match the layer's v_head_dim.
