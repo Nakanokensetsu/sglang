@@ -39,6 +39,25 @@
 > identical VRAM · quality **19/20**, tied with the 0.5.15 stack on a
 > discriminative long-context test · 8 patches that apply with `patch -p0`.
 >
+> ### Also here: **the KV pool is the limit, not the mamba cache**
+>
+> **→ [`escha_oscar_0519_kv_pool/README.md`](escha_oscar_0519_kv_pool/README.md)** —
+> three users with 66 K contexts went from a 57-second cold prefill *every turn*
+> to **0.3 s**, on the same 2x 12 GB box, by moving three flags. No metric got worse.
+>
+> `--max-total-tokens` is a cap, not a size: setting it to 210000 changed nothing
+> until `--mem-fraction-static` went 0.78 -> 0.85. And widening the pool **requires**
+> `--chunked-prefill-size` 4096 -> 8192, or a hybrid SSM model needs
+> `210,000/4,096 = 51` checkpoint slots against a pool of 32 and prefix reuse collapses.
+>
+> Also: three mamba-side levers (PR #38000, an int8 checkpoint pool, a bigger chunk)
+> moved the number **not at all** - the binding constraint was
+> `3 x 66,000 > max_total_num_tokens` the whole time · a config that **starts fine and
+> dies on the first long prefill**, because Triton JITs kernels onto the device after
+> the startup VRAM numbers print · the cliff shows up as 100 % utilisation at *falling*
+> power, not as an allocation error · measurement traps: `--allow-auto-truncate`
+> silently answering from a truncated document, and comparing a warm server to a cold one.
+>
 > Everything below is the upstream SGLang README.
 
 ---
