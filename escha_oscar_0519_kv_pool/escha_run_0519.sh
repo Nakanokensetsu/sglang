@@ -27,7 +27,7 @@
 # 長文prefill中の短文TTFT 0.135->0.123s、並列10 エラー0・電力169->175W で崖なし)。
 # 品質 Test D(96K) 17/20 -> 18/20。
 #
-# --context-length 114688:
+# --context-length 131072:
 #   実測で全速を確認した最大値。104K/112K/120K はいずれも 888〜922 tok/s・165W で全速、
 #   130K(実122,133tok)で崖(450 tok/s)。設定値を実用上限より大きくすると
 #   利用者が知らずに崖を踏むので、ここで止める。
@@ -57,12 +57,12 @@ export SGLANG_OSCAR_V_ROTATION_PATH=${ROTATION_DIR:?set to your OSCAR rotation c
 # 判別テスト D が 38/41 → 33/41 と悪化・prefill -1.7% のため不採用。
 
 # --- ビルド/実行環境 ---
-# 2026-09-20: OSCAR mixed-KV 移植ツリーを PYTHONPATH で被せる。
+# 2026-09-20: 移植済み sglang ツリー(escha_sglang_0519/)を PYTHONPATH で被せる。
 # venv の sglang 0.5.19 は無傷のまま残す(pip 再インストールで消えない利点がある一方、
 # 逆に venv 側を更新しても効かなくなる。移植ツリーが正)。
 # 中身: 上流 #38191/#37943/#39526 の取り込み + mixed-KV 移植(既定OFFで不活性)。
 # 戻す時はこの export を消すだけ。
-export PYTHONPATH=${PORT_TREE:?set to this repo's python/ overlay}${PYTHONPATH:+:$PYTHONPATH}
+export PYTHONPATH=${PORT_TREE:?set to this repo's patched sglang tree}${PYTHONPATH:+:$PYTHONPATH}
 
 NVLIBS=${VENV_ROOT:?set to the venv holding sglang 0.5.19}/.venv/lib/python3.12/site-packages/nvidia
 export PATH="/usr/local/cuda/bin:$PATH"
@@ -82,7 +82,7 @@ exec ./.venv/bin/python -m sglang.launch_server \
   --mamba-ssm-dtype float16 \
   --kv-cache-dtype int2 --kv-cache-quant-group-size 64 \
   --mamba-radix-cache-strategy extra_buffer_lazy \
-  --context-length 114688 \
+  --context-length 131072 \
   --chunked-prefill-size 8192 \
   --max-mamba-cache-size 32 \
   --disable-prefill-cuda-graph \

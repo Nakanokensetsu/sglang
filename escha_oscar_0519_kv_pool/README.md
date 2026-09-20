@@ -13,6 +13,7 @@ by moving three flags. No VRAM was added that was not already sitting idle.**
 | short-prompt TTFT during a long prefill | 0.135 s | 0.123 s |
 | concurrency 10 | 0 errors, 169 W, 70 °C | 0 errors, 175 W, 78 °C |
 | discriminative long-context test (96 K) | 17/20 | 18/20 |
+| `--context-length` | 114,688 | **131,072** (see below) |
 
 Not one metric got worse.
 
@@ -104,6 +105,61 @@ work is not actually flowing. Healthy full load here is ~97-99 % at 169-175 W an
 At concurrency 10 the new configuration drew **175 W at 78 °C with zero errors**,
 against 169 W / 70 °C before. Power went *up*: more real work, not less.
 
+## Raising `--context-length` afterwards: 131,072, at a price
+
+With a 210,000-token pool, a `--context-length` of 114,688 leaves per-session
+capacity on the table. Raising it to 131,072 works, but it is not free, and the
+cost does **not** come out of the KV pool.
+
+A 131,066-token prefill (the cap, to the token):
+
+```
+810.6 tok/s · 157 W · 73 °C · 100 % utilisation
+```
+
+**Not a cliff** — the cliff on this hardware is 100 % utilisation at *falling*
+power (~45 W, 48 °C). But it is **~20 % slower than the 1,010 tok/s measured at
+114 K**.
+
+The reason is a second buffer that has nothing to do with the pool. INT2 prefill
+dequantises the cached prefix into dense `model_dtype` before attention:
+
+```python
+prefix_k, prefix_v = dequantize_prefix_kv(kv_pool, layer.layer_id,
+                                          prefix_indices, model_dtype)
+```
+
+int2 → fp16 is an 8× expansion, sized by sequence length, allocated **outside**
+`--mem-fraction-static`. Roughly 962 MB at 112 K. So:
+
+| | where it lives | size |
+|---|---|---|
+| KV pool, 210,000 tokens | inside the static budget | 813 MiB |
+| prefill dequant buffer | outside it, per request | ~1 GB at 128 K |
+
+Raising `--mem-fraction-static` to 0.85 to grow the pool **shrinks the
+non-static remainder that this buffer draws from**, so the headroom for a long
+context is tighter than it was at 0.78. Both changes are good, but they pull on
+the same 12 GB from opposite ends.
+
+**Watch for empty responses near the cap.** At 131,066 input tokens against a
+131,072 limit there is no room left to generate, and the request returns `''`
+with `finish_reason=stop` — the symptom in
+[#5409](https://github.com/sgl-project/sglang/issues/5409), where truncation does
+not subtract `max_tokens`. At 114 K the cap was far enough away to be hard to
+hit; at 128 K it is inside normal use.
+
+## What about spilling to host memory?
+
+`--enable-hierarchical-cache` moves evicted prefixes to host RAM instead of
+dropping them, which is the obvious answer to "three chains don't fit". **It is
+not usable on a hybrid GDN model right now.**
+[#39830](https://github.com/sgl-project/sglang/issues/39830) (open) reproduces
+20/20: a prefix restored from the host tier answers *in a different pass's
+voice*, wrong, with no crash, no warning, `cached_tokens` reporting a full hit
+and `finish_reason=stop`. It also cannot be combined with
+`--enable-int8-mamba-checkpoint`, which is rejected at startup.
+
 ## Launch flags
 
 The full script, with local paths replaced by `${...}` placeholders:
@@ -116,7 +172,7 @@ The flags that matter for this result:
 --kv-cache-dtype int2 --kv-cache-quant-group-size 64
 --mamba-radix-cache-strategy extra_buffer_lazy
 --attention-backend triton
---context-length 114688
+--context-length 131072              # was 114688
 --chunked-prefill-size 8192          # was 4096
 --max-mamba-cache-size 32
 --max-total-tokens 210000            # was 150000
