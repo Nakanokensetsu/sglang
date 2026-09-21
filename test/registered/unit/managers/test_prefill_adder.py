@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,12 @@ class _RecordingDelayer:
     def negotiate_should_allow_prefill(self, local_prefillable, **kwargs):
         self.calls.append(local_prefillable)
         return self.allow
+
+
+# 下の7件は「1本あたりの上限 F が必ず効く」前提で書かれている。実運用の既定は
+# 「譲る相手がいるときだけ効く」+「予算を本数で均等割り」なので、上限の機構そのもの
+# を検証したいテストはこのフラグで無条件適用に固定する。
+_ceiling_always = patch.dict(os.environ, {"SGLANG_LONG_PREFILL_CEILING_ALWAYS": "1"})
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -905,6 +912,7 @@ class TestPrefillAdder(CustomTestCase):
             max_concurrent_chunked_reqs=capacity,
         )
 
+    @_ceiling_always
     def test_threshold_chunks_new_long_req_at_ceiling(self):
         adder = self._create_concurrency_adder(
             kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
@@ -931,6 +939,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertNotIn(req, adder.new_chunked_reqs)
         self.assertIn(req, adder.can_run_list)
 
+    @_ceiling_always
     def test_capacity_allows_budget_over_threshold_concurrent_reqs(self):
         # B // F requests each get exactly F tokens in one pass; the request
         # that would exceed the capacity is refused with SKIP (not OTHER), so
@@ -954,6 +963,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertNotIn(fifth, adder.can_run_list)
         fifth.set_extend_range.assert_not_called()
 
+    @_ceiling_always
     def test_capacity_full_skips_long_but_admits_short(self):
         # The QoS property: with every mid-prefill slot taken by long
         # prompts, a short prompt behind them still schedules whole instead
@@ -978,6 +988,7 @@ class TestPrefillAdder(CustomTestCase):
         short_req.set_extend_range.assert_called_once_with(0, 1000)
         self.assertIn(short_req, adder.can_run_list)
 
+    @_ceiling_always
     def test_carried_chunked_req_capped_at_threshold(self):
         # One carried request cannot drain the pool ahead of the others.
         adder = self._create_concurrency_adder(
@@ -996,6 +1007,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder0.add_chunked_req(req0), req0)
         req0.set_extend_range.assert_called_once_with(0, 8192)
 
+    @_ceiling_always
     def test_parked_carried_req_holds_completion_reservation(self):
         # A carried request that finds the per-pass pool drained is parked:
         # it stays mid-prefill (returned), gets no chunk, and its whole
@@ -1013,14 +1025,86 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_not_called()
         self.assertEqual(adder.rem_total_token_offset - offset_before, 9000 + 8 + 1)
 
-        # Without the ceiling the same drained pool force-adds a zero-length
-        # chunk (stock behavior preserved on the disabled path).
+        # Without the ceiling the same drained pool returns the request
+        # without giving it a chunk and without charging the reservation --
+        # stock 0.5.19 behavior, preserved unchanged on the disabled path.
+        # (It is returned, so ownership is kept and the KV cannot leak.)
         adder0 = self._create_concurrency_adder(
             kv_tokens=1_000_000, chunk_pool=0, threshold=0, capacity=1
         )
         req0 = self._create_long_req("carried", 9000)
+        offset_before0 = adder0.rem_total_token_offset
+
         self.assertIs(adder0.add_chunked_req(req0), req0)
-        self.assertIn(req0, adder0.can_run_list)
+
+        self.assertNotIn(req0, adder0.can_run_list)
+        req0.set_extend_range.assert_not_called()
+        self.assertEqual(adder0.rem_total_token_offset, offset_before0)
+
+    # --- 上限をいつ・いくつ適用するか（2026-09-21/22 の自前挙動） ---
+
+    def test_ceiling_off_when_nobody_is_waiting(self):
+        # 譲る相手がいない回に絞る理由はない。上流は無条件に絞るので、予算を
+        # 遊ばせたまま長文が B/F 倍遅くなる（PR #34623 の Known trade-off）。
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        self.assertEqual(adder.waiting_queue_len, 0)
+        self.assertEqual(adder.num_carried_chunked_reqs, 0)
+
+        self.assertEqual(adder._effective_long_prefill_ceiling(), 0)
+
+    @_ceiling_always
+    def test_ceiling_always_applies_when_nobody_is_waiting(self):
+        # 逃がし弁: 単独巡航中も刻みたいときは上限を無条件適用に戻せる。
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+
+        self.assertEqual(adder._effective_long_prefill_ceiling(), 2048)
+
+    def test_ceiling_splits_the_budget_evenly_under_contention(self):
+        # 待機が4本なら 8192 / 4 = 2048 ずつ。予算は割り切られるので遊びが出ない。
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=1,
+            rem_chunk_tokens=8192,
+            rem_input_tokens=100_000_000,
+            long_prefill_token_threshold=4096,
+            max_concurrent_chunked_reqs=8,
+            waiting_queue_len=4,
+        )
+
+        self.assertEqual(adder._effective_long_prefill_ceiling(), 2048)
+
+    def test_even_split_never_exceeds_the_threshold(self):
+        # 本数が少なくても F が上限として効く（1本なら 8192 だが F=2048 で頭打ち）。
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=1,
+            rem_chunk_tokens=8192,
+            rem_input_tokens=100_000_000,
+            long_prefill_token_threshold=2048,
+            max_concurrent_chunked_reqs=4,
+            waiting_queue_len=1,
+        )
+
+        self.assertEqual(adder._effective_long_prefill_ceiling(), 2048)
+
+    def test_even_split_counts_carried_and_waiting_together(self):
+        # 分母は「prefill 中 + 待機中」。2 + 2 = 4 本で 8192 / 4 = 2048。
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=1,
+            rem_chunk_tokens=8192,
+            rem_input_tokens=100_000_000,
+            long_prefill_token_threshold=8192,
+            max_concurrent_chunked_reqs=8,
+            waiting_queue_len=2,
+            num_carried_chunked_reqs=2,
+        )
+
+        self.assertEqual(adder._effective_long_prefill_ceiling(), 2048)
 
     def test_reserve_to_completion_blocks_second_long_req(self):
         # Two 10K-token prompts in a 20K-token KV pool. With the ceiling on,
@@ -1099,6 +1183,7 @@ class TestPrefillAdder(CustomTestCase):
         req.origin_input_ids = list(range(num_tokens))
         return req
 
+    @_ceiling_always
     def test_ignore_eos_chunked_at_ceiling(self):
         adder = self._create_ignore_eos_adder(
             kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
@@ -1121,6 +1206,7 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once_with(0, 1000)
         self.assertNotIn(req, adder.new_chunked_reqs)
 
+    @_ceiling_always
     def test_ignore_eos_capacity_full_skips(self):
         adder = self._create_ignore_eos_adder(
             kv_tokens=1_000_000, chunk_pool=16384, threshold=2048, capacity=2

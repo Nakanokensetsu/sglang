@@ -1329,8 +1329,11 @@ class Scheduler(
         _n = os.environ.get("SGLANG_PREFILL_CONCURRENCY", "").strip()
         # 既定は「並列セッション制限数 x 2」。制限いっぱいまで同時に走っても
         # 予算が足り、かつ1本あたりが小さいので後から来た要求の待ちが短い。
-        if not _n.isdigit() and self.max_running_requests:
-            _n = str(max(1, int(self.max_running_requests) * 2))
+        # getattr: このメソッドを Scheduler の組み立て途中(モック含む)から呼ぶ経路では
+        # max_running_requests がまだ無い。その場合は N 逆算を諦めて CLI 値に従う。
+        _limit = getattr(self, "max_running_requests", None)
+        if not _n.isdigit() and _limit:
+            _n = str(max(1, int(_limit) * 2))
         # さらに細かく刻みたいときの分割係数 K。F = 予算 / (N * K)。
         # 小さいほど短文の待ちは縮むが、パス数が増えて長文の prefill が落ちる
         # (実測: F=1024 で 1,216 tok/s、F=512 で 1,098 tok/s = -14%)。
