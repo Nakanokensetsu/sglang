@@ -4424,7 +4424,7 @@ class Scheduler(
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
-            batch, batch_result, chunked_req=self.chunked_req
+            batch, batch_result, chunked_reqs=self.chunked_reqs
         )
 
     def _copy_auxiliary_output_to_cpu(
@@ -5080,7 +5080,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.chunked_reqs,
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(

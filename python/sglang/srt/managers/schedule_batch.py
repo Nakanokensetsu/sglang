@@ -3047,8 +3047,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         bs = self.batch_size()
         self.forward_mode = ForwardMode.EXTEND
         # Stale residue from this object's life as a prefill batch; the
-        # extend-merge path would exclude (silently drop) that req otherwise.
-        self.chunked_req = None
+        # extend-merge path would exclude (silently drop) those reqs otherwise.
+        self.chunked_reqs = ()
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None

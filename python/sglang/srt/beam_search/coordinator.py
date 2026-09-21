@@ -38,7 +38,7 @@ tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import Collection, TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -250,7 +250,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         return sorted(stop_ids)
 
     def maybe_select_and_relay(
-        self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
+        self, batch: ScheduleBatch, batch_result, chunked_reqs: Collection[Req] = ()
     ) -> None:
         """Per-forward relay hook: overwrite beam rows' relayed tokens with
         joint-selected ones. O(1) when no beam group is live."""
@@ -277,7 +277,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     group is None
                     or group.state != BeamGroupState.DECODING
                     or group.num_generated > 0
-                    or req is chunked_req  # mid-chunk leader: no selection yet
+                    or any(req is c for c in chunked_reqs)  # mid-chunk: no selection yet
                     or req.is_retracted
                     or req.finished()
                 ):
