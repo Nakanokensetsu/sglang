@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -54,6 +55,15 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+# 上流 PR #38000 (2026-09-19 取り込み)。ComponentData.metadata のフラグ:
+# 挿入者以外のリクエストがこのノードの mamba 状態にマッチした = 再利用されている。
+# coverage thinning はこれを犠牲にしてはいけない。
+MAMBA_REUSED_KEY = "mamba_reused"
 
 
 class MambaComponent(TreeComponent):
@@ -132,8 +142,14 @@ class MambaComponent(TreeComponent):
             case LRURefreshPhase.WALKDOWN:
                 return
             case LRURefreshPhase.MATCH_END:
-                if node.component_data[ct].value is not None:
-                    self.tree_core.lru_lists[ct].reset_node_mru(node)
+                cd = node.component_data[ct]
+                if cd.value is not None:
+                    lru = self.tree_core.lru_lists[ct]
+                    # The inserter's own re-match after a chunk insert lands on
+                    # the MRU node; any other match proves the state is reused.
+                    if not lru.is_mru(node):
+                        cd.metadata[MAMBA_REUSED_KEY] = True
+                    lru.reset_node_mru(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -408,10 +424,26 @@ class MambaComponent(TreeComponent):
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
             return x.id
+        victim = self._thinning_victim(x)
+        if victim is not x:
+            # x stays at the LRU tail so the next step re-evaluates its chain.
+            self._tombstone_device_state(victim, tracker, device_frees, host_frees)
+            return None
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        self._tombstone_device_state(x, tracker, device_frees, host_frees)
+        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+        return None
+
+    def _tombstone_device_state(
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
         self.tree_core._evict_component_and_detach_lru(
-            x,
+            node,
             self,
             target=EvictLayer.DEVICE,
             tracker=tracker,
@@ -419,10 +451,64 @@ class MambaComponent(TreeComponent):
             host_frees=host_frees,
         )
         self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            node, self, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
-        return None
+
+    def _thinning_victim(self, x: UnifiedTreeNode) -> UnifiedTreeNode:
+        """Pick which state of the LRU-oldest node's chain to drop.
+
+        上流 PR #38000 (2026-09-19 取り込み)。
+        x の下に伸びる単一子チェーンの状態は同じ冷たいパスのもので、次に老化する。
+        「隣接状態とのギャップが最小になるもの」を落とすと、そのパスの
+        チェックポイントが深さ方向に散らばったまま残る。素の LRU 末尾 evict は
+        **浅い側から剥がす**ので、分岐マッチが必要とするものから先に消える。
+        分岐・ロック済み・session 参照・再利用済み・葉の保持者は境界で、犠牲にしない。
+        """
+        ct = self.component_type
+        root = self.tree_core.root_node
+        if len(x.children) != 1:
+            return x
+        depth = 0
+        node = x
+        while node is not root:
+            depth += len(node.key)
+            node = node.parent
+        # Nearest state holder above x (else the root) bounds its gap.
+        prev_depth = 0
+        d = depth
+        node = x
+        while node.parent is not root:
+            d -= len(node.key)
+            node = node.parent
+            if node.component_data[ct].value is not None:
+                prev_depth = d
+                break
+        # (depth, node) for every state holder on the chain, x first.
+        holders = [(depth, x)]
+        node = x
+        while len(node.children) == 1:
+            node = next(iter(node.children.values()))
+            depth += len(node.key)
+            if node.component_data[ct].value is not None:
+                holders.append((depth, node))
+        chain_end = depth
+        victim = x
+        best_gap = None
+        for i, (_, node) in enumerate(holders):
+            cd = node.component_data[ct]
+            if node is not x and (
+                len(node.children) != 1
+                or cd.lock_ref > 0
+                or cd.session_ref > 0
+                or cd.metadata.get(MAMBA_REUSED_KEY)
+            ):
+                continue
+            lo = holders[i - 1][0] if i > 0 else prev_depth
+            hi = holders[i + 1][0] if i + 1 < len(holders) else chain_end
+            if best_gap is None or hi - lo < best_gap:
+                best_gap = hi - lo
+                victim = node
+        return victim
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
@@ -492,12 +578,48 @@ class MambaComponent(TreeComponent):
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
+        slot = self._try_alloc_mamba_slot()
+        assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
+    def _try_alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """One mamba slot, evicting if needed; None when every slot is pinned.
+
+        上流 PR #37943 より(2026-09-19 取り込み)。extra_buffer_lazy は
+        1リクエスト4スロットしか持たず、overlap 下では同一ステップで予備が
+        二重に使われる(境界で `mamba_lazy_prealloc_at_boundary` が待機スロットを
+        取る一方、直前の prefill の `cache_unfinished_req` が寄贈ぶんの
+        入れ替えに5つ目を要求する)。**非 lazy の extra_buffer(5スロット)は無関係**。
+        アサートで落とす代わりに、その境界のチェックポイントを1つ見送る。
+        """
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
         return slot
+
+    # Skipped donations recur at every chunk boundary while the pool stays
+    # pinned, so log the first one and then every 1000th.
+    _skipped_donations = 0
+
+    def _log_skipped_donation(self, req: Req) -> None:
+        self._skipped_donations += 1
+        if self._skipped_donations == 1 or self._skipped_donations % 1000 == 0:
+            ct = self.component_type
+            allocator = self.cache.req_to_token_pool.mamba_allocator
+            logger.warning(
+                "No free mamba slot to donate the checkpoint of request %s at "
+                "seqlen %s; skipping it (%d skipped so far). Pool: available=%d "
+                "evictable=%d protected=%d. Every slot is held by a running "
+                "request: raise --max-mamba-cache-size or "
+                "--mamba-full-memory-ratio to keep prefix reuse.",
+                req.rid,
+                req.kv.mamba_last_track_seqlen,
+                self._skipped_donations,
+                allocator.available_size(),
+                self.tree_core.component_evictable_size_[ct],
+                self.tree_core.component_protected_size_[ct],
+            )
 
     @property
     def int8_ckpt_pool(self):
@@ -571,10 +693,20 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            # Donate the mamba index to the radix cache instead of copying.
+            # Donate the mamba index to the radix cache instead of copying. All
+            # strategies but int8 no_buffer need a fresh slot before donating; a
+            # pinned pool skips this boundary's checkpoint and the next one retries.
+            needs_new_slot = (
+                self.cache.enable_mamba_extra_buffer or self.int8_ckpt_pool is None
+            )
+            new_slot = None
+            if needs_new_slot:
+                new_slot = self._try_alloc_mamba_slot()
+                if new_slot is None:
+                    self._log_skipped_donation(req)
+                    return 0
             if self.int8_ckpt_pool is not None:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._alloc_mamba_slot()
                     src_active = (
                         self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                             req, new_slot
@@ -587,14 +719,13 @@ class MambaComponent(TreeComponent):
                         req.kv.mamba_pool_idx.view(-1)
                     )
             elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
                 mamba_value_donated = (
                     self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
                     )
                 )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
+                mamba_value_donated = new_slot
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
                 # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
