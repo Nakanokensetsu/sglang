@@ -1373,8 +1373,96 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
     return {}
 
 
+def _unified_mixed_kv_active(view: Any) -> bool:
+    """True when --kv-cache-dtype int2 + the SGLANG_ENABLE_MIXED_KV_* env vars
+    would route ModelRunner through the unified HP+int2 KV pool. Mirrors the
+    gates in ``model_runner_kv_cache_mixin._init_pools`` and
+    ``pool_configurator._attention_supports_mixed_kv``.
+
+    PR #32129 移植 2026-09-19: 上流では ServerArgs._handle_page_size 内の
+    メソッドだったが、0.5.19 では page_size の既定値決定が本 post-process に
+    移ったので、view ベースへ書き換えてここへ再配置した。
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get():
+        return False
+    if view.kv_cache_dtype != "int2":
+        return False
+    prefill_backend, decode_backend = attention_backends_of(view)
+    attn_ok = (prefill_backend == "triton" and decode_backend == "triton") or (
+        prefill_backend == "fa3" and decode_backend == "triton"
+    )
+    if not attn_ok:
+        return False
+    if view.disaggregation_mode not in (None, "null"):
+        return False
+    if view.speculative_algorithm is not None:
+        return False
+    # Hybrid SWA models route through a separate pool and are explicitly
+    # excluded from the unified path. Mamba/GDN hybrids likewise: in
+    # ``KVCacheConfigurator`` the ``mambaish_config`` branch is taken BEFORE
+    # ``_mixed_kv_int2_enabled``, so those models keep HybridLinearKVPool and
+    # never see the unified pool. Without this check the env var would still
+    # force ``page_size = N_Q`` here -- changing radix granularity for no
+    # benefit. (2026-09-19 移植時に追加。上流PRはこの分岐順を前提にしていない。)
+    # We only check this when a real model path is configured (the
+    # dummy/none paths bypass model load).
+    if view.model_path.lower() not in ["none", "dummy"]:
+        try:
+            from sglang.srt.configs.hybrid_arch import mambaish_config
+
+            model_config = model_config_of(view)
+            if getattr(model_config, "is_hybrid_swa", False):
+                return False
+            if mambaish_config(model_config) is not None:
+                return False
+        except Exception:
+            # If the config cannot be loaded yet, defer the decision.
+            # ``model_runner_kv_cache_mixin`` re-checks before constructing the
+            # unified pool, so a missed positive here only loses page_size
+            # autoconfig (the user can always set it explicitly).
+            return False
+    return True
+
+
+def _unified_mixed_kv_page_size() -> int:
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.unified_kv_pool import (
+        compute_page_geometry,
+        resolve_hp_dtype,
+    )
+
+    hp_dtype = resolve_hp_dtype(envs.SGLANG_MIXED_KV_HP_DTYPE.get())
+    _, n_q = compute_page_geometry(hp_dtype)
+    return int(n_q)
+
+
 @register_post_process
 def _page_size_default(view: Any) -> dict:
+    # Unified mixed-KV (int2 + HP windows) requires the radix-cache /
+    # allocator page_size to equal ``N_Q`` so tree splits land on physical
+    # page boundaries and the allocator preserves whole-page exclusive
+    # ownership (see ``srt/mem_cache/unified_kv_allocator.py``). This runs
+    # before the ``page_size is not None`` early return so an explicit
+    # mismatching --page-size is rejected rather than silently kept.
+    if _unified_mixed_kv_active(view):
+        n_q = _unified_mixed_kv_page_size()
+        if view.page_size is None:
+            logger.info(
+                "Unified mixed KV (int2) enabled: page_size=%s (= N_Q).", n_q
+            )
+            return {"page_size": n_q}
+        if view.page_size != n_q:
+            from sglang.srt.environ import envs
+
+            raise ValueError(
+                f"Unified mixed KV requires --page-size={n_q} (= N_Q for "
+                f"hp_dtype={envs.SGLANG_MIXED_KV_HP_DTYPE.get()}); got "
+                f"--page-size={view.page_size}."
+            )
+        return {}
+
     if view.page_size is not None:
         return {}
 

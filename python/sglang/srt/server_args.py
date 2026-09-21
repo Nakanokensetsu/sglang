@@ -599,7 +599,9 @@ class ServerArgs:
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                'recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. "int2" '
+                "selects the OSCAR mixed-precision INT2 KV cache (Triton "
+                "quantized KV path with high-precision sink/recent windows)."
             ),
             choices=[
                 "auto",
@@ -611,11 +613,22 @@ class ServerArgs:
                 "nvfp4",
                 "fp4_mx_block16",
                 "fp4_e2m1",
+                # 2026-09-18 自前移植: OSCAR int2 量子化KV(Escha-W2用)
+                "int2",
             ],
             resolvable=True,
         ),
         NS("model"),
     ] = "auto"
+    kv_cache_quant_group_size: A[
+        Optional[int],
+        (
+            "Group size (along head_dim) for --kv-cache-dtype int2 quantization. "
+            "Defaults to head_dim (one group per head) when unset. "
+            "(2026-09-18 自前移植: OSCAR int2)"
+        ),
+        NS("model"),
+    ] = None
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
     ] = False

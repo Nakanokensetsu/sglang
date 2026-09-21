@@ -216,3 +216,78 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+class Qwen38ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
+    """Thinking-budget control for the Qwen3.5/3.8 family (248k vocab).
+
+    The Qwen3 subclass above carries the OLD 151k-vocab ids; the 3.5/3.8
+    family retokenized (<think>=248068, </think>=248069) and silently never
+    triggers under it. Newline stays 198.
+    """
+
+    THINKING_START_TOKEN_ID: int = 248068
+    THINKING_END_TOKEN_ID: int = 248069
+    NEW_LINE_TOKEN_ID: int = 198
+
+
+# --- 思考予算プロセッサの解決(2026-09-19 追加) -------------------------------
+# sglang にはモデル別サブクラスが並んでいるだけで、「どれを使うか」を選ぶ配線が
+# 無い(Glm4Moe/Qwen3/DeepSeekR1/Inkling のいずれも定義ファイル以外からの参照が0件)。
+# そのため呼び出し側が custom_logit_processor に callable を明示しない限り
+# custom_params.thinking_budget は黙って無視される(上流 issue #25536 と同じ穴)。
+# tokenizer から <think>/</think> の実 ID を引いて対応クラスを選ぶ。
+# 一致が無ければその場でサブクラスを生成するので、新モデルでも ID の
+# ハードコードを足し直す必要がない。
+_THINK_TOKEN_CANDIDATES = (("<think>", "</think>"), ("<thinking>", "</thinking>"))
+_NEWLINE_FALLBACK_ID = 198
+
+
+def _think_token_ids(tokenizer):
+    if tokenizer is None:
+        return None
+    for start_tok, end_tok in _THINK_TOKEN_CANDIDATES:
+        try:
+            sid = tokenizer.convert_tokens_to_ids(start_tok)
+            eid = tokenizer.convert_tokens_to_ids(end_tok)
+        except Exception:
+            continue
+        unk = getattr(tokenizer, "unk_token_id", None)
+        if sid is None or eid is None or sid == unk or eid == unk or sid == eid:
+            continue
+        try:
+            nid = tokenizer.convert_tokens_to_ids("\n")
+            if nid is None or nid == unk:
+                nid = _NEWLINE_FALLBACK_ID
+        except Exception:
+            nid = _NEWLINE_FALLBACK_ID
+        return int(sid), int(eid), int(nid)
+    return None
+
+
+@lru_cache(maxsize=8)
+def _thinking_budget_cls_for(start_id: int, end_id: int, newline_id: int):
+    for cls in ThinkingBudgetLogitProcessor.__subclasses__():
+        if (
+            getattr(cls, "THINKING_START_TOKEN_ID", None) == start_id
+            and getattr(cls, "THINKING_END_TOKEN_ID", None) == end_id
+            and getattr(cls, "NEW_LINE_TOKEN_ID", None) == newline_id
+        ):
+            return cls
+    return type(
+        "ResolvedThinkingBudgetLogitProcessor",
+        (ThinkingBudgetLogitProcessor,),
+        {
+            "THINKING_START_TOKEN_ID": start_id,
+            "THINKING_END_TOKEN_ID": end_id,
+            "NEW_LINE_TOKEN_ID": newline_id,
+        },
+    )
+
+
+def resolve_thinking_budget_processor(tokenizer):
+    """このモデルに合う思考予算プロセッサを返す。解決できなければ None。"""
+    ids = _think_token_ids(tokenizer)
+    if ids is None:
+        return None
+    return _thinking_budget_cls_for(*ids)
