@@ -76,12 +76,40 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
+    def _with_mixed_quant_slack(self, req: Req, indices: torch.Tensor) -> torch.Tensor:
+        """Fold the request-owned quant-page slack slots (mixed HP+int2 KV path)
+        into the indices being freed so the atomic quant page is returned whole."""
+        slack = req.mixed_kv_quant_slack_indices
+        if slack.numel() == 0:
+            return indices
+
+        req.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
+        req.mixed_kv_quant_slack_cutoff_len = None
+        return torch.cat([indices.to(torch.int64), slack.to(indices.device)])
+
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
-        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
+        # PR #32129 retarget: the request-owned quant-page slack slots share
+        # the row tail's atomic int2 quant page, and the int2 allocator folds
+        # slot ids to whole pages with torch.unique -- so slack must ride in
+        # the SAME free() call or the page is handed back twice. That rules out
+        # free_kv_row()'s per-segment split; mixed-KV never runs under SWA, so
+        # the split has nothing to do on this path anyway.
+        if req.mixed_kv_quant_slack_indices.numel() == 0:
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
+        else:
+            assert (
+                req.kv.swa_evicted_seqlen == 0
+            ), "mixed-KV quant slack is not supported with SWA eviction"
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
+            ]
+            self.token_to_kv_pool_allocator.free(
+                self._with_mixed_quant_slack(req, kv_indices)
+            )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

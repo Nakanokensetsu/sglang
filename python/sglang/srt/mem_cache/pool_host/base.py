@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 import threading
 from functools import wraps
 from typing import Optional
@@ -9,7 +10,7 @@ from typing import Optional
 import psutil
 import torch
 
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group, get_world_group
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -24,6 +25,23 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
+# 2026-09-20 自前変更: 定数だと実機に合わせられない。ホストプールは
+# **モデル重みのロード中**(= MemAvailable が最も低い瞬間)に確保されるので、
+# 32GB 機では既定 10GB の予約が効きすぎて 0.5GB/rank しか取れず、
+# `Not enough host memory available` で起動に失敗する。
+# SGLANG_HICACHE_HOST_RESERVE_GB で上書きできるようにした(既定は従来どおり 10)。
+def _host_memory_reserve_bytes() -> int:
+    raw = os.environ.get("SGLANG_HICACHE_HOST_RESERVE_GB", "").strip()
+    if raw:
+        try:
+            return int(float(raw) * (1024**3))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid SGLANG_HICACHE_HOST_RESERVE_GB=%r", raw
+            )
+    return 10 * (1024**3)
+
+
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
@@ -48,15 +66,55 @@ def ranks_per_host() -> int:
     return max(world_group.world_size // get_parallel().nnodes, 1)
 
 
+def host_memory_sync_group() -> Optional[torch.distributed.ProcessGroup]:
+    """CPU group whose ranks read host memory together before any of them allocates.
+
+    2026-09-21 自前移植: 上流 PR #38157(未マージ, issue #38156)。
+
+    テンソル並列群のランクは**同じホストプールを同じ順番で**作るので、プール1本に
+    つき1回の集団通信が全ランクで対になる。world group ではそれが保証されない
+    (パイプライン段ごとに持つ層が違い、作るプールも違う)。
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    try:
+        tp_group = get_tp_group()
+    except AssertionError:
+        return None
+    if tp_group.world_size <= 1:
+        return None
+    return tp_group.cpu_group
+
+
 def host_memory_budget_bytes() -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
     psutil reports the whole machine, so co-located ranks each see the same free
     memory; without the split every rank sizes its pool against all of it and
     the host is oversubscribed by the number of ranks it holds.
+
+    2026-09-21 自前移植(上流 PR #38157 / issue #38156):
+    ランク数で割るのは「どのランクもまだ確保していない時点の読み値」に対してだけ正しい。
+    実際は各ランクが別々のタイミングでここへ来るため、先行ランクがピン留めした後に
+    来たランクは **減った available を見て、なおランク数で割る** = 先行分を二重に
+    差し引く。結果、収まるはずのホストで `Not enough host memory available` が出る。
+    TP群で MIN の all_reduce を取ると、(a) 集団通信がバリアになるので読み値が揃う前に
+    誰も確保せず、(b) 最小値 = 最も遅い読み値 なので、その群が既に作ったプールは
+    ちょうど1回だけ反映される。
+
+    **2026-09-20 に TP2 でこれを踏んだ**: `--hicache-ratio 2` が
+    `Requesting 2.55 GB but only have 0.52 GB free` で起動失敗。
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-    return free // ranks_per_host()
+    reserve = _host_memory_reserve_bytes()
+    free = psutil.virtual_memory().available
+    sync_group = host_memory_sync_group()
+    if sync_group is not None:
+        reading = torch.tensor(free, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            reading, op=torch.distributed.ReduceOp.MIN, group=sync_group
+        )
+        free = int(reading.item())
+    return (free - reserve) // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:

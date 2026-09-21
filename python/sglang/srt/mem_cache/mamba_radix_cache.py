@@ -19,6 +19,7 @@ limitations under the License.
 The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
+import math
 import os
 from array import array
 from collections import defaultdict
@@ -31,6 +32,8 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
+from sglang.srt.mem_cache.unified_kv_pool import resolve_mixed_kv_pool_from_allocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -440,6 +443,11 @@ class LRUList:
                 raise Exception(msg)
 
 
+# mixed HP+int2 KV: チェックポイント境界が HP-recent 帯に落ちて公開を見送った回数。
+# 高止まりするなら SGLANG_MIXED_KV_RECENT_TOKENS を下げるか track interval を上げる。
+_MIXED_KV_PUBLISH_SKIPPED = 0
+
+
 class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert (
@@ -449,6 +457,12 @@ class MambaRadixCache(BasePrefixCache):
             )
             or isinstance(
                 params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            )
+            # mixed HP+int2 KV (2026-09-19): hybrid GDN の full-attention 側を
+            # unified int2 プールに差し替えると、KV スロットの割り当ても
+            # UnifiedInt2HPKVAllocator が持つ。
+            or isinstance(
+                params.token_to_kv_pool_allocator, UnifiedInt2HPKVAllocator
             )
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
@@ -473,10 +487,85 @@ class MambaRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+        # 木がキャッシュしてよいのは共有 HP-prefix と quant スロットだけ。
+        # リクエスト専有の HP-recent スロットは `_mixed_kv_tail_to_drop` で落とす
+        # (スロットIDがリクエスト間で衝突するため。正しさの問題)。
+        # match_prefix は `_mixed_kv_match_cap_overhead` で cap する。
+        self._mixed_kv_enabled = False
+        self._mixed_kv_hp_prefix_tokens = 0
+        self._mixed_kv_match_cap_overhead = 0
+        kvc = resolve_mixed_kv_pool_from_allocator(self.token_to_kv_pool_allocator)
+        self._mixed_kv_pool = kvc
+        if kvc is not None:
+            self._mixed_kv_enabled = True
+            self._mixed_kv_hp_prefix_tokens = int(kvc.hp_prefix_tokens)
+            flush_overflow = max(0, int(kvc.flush_interval) - 1)
+            self._mixed_kv_match_cap_overhead = (
+                int(kvc.hp_recent_tokens) + flush_overflow
+            )
+
         if params.enable_metrics:
             self.init_metrics_collector()
 
         self.reset()
+
+    # ===== mixed HP+int2 KV helpers (RadixCache と同じ意味・同じ規約) =====
+
+    def _with_mixed_quant_slack(self, req: Req, indices: torch.Tensor) -> torch.Tensor:
+        """Fold request-owned quant-page slack slots into the indices being
+        freed so the atomic int2 quant page is returned whole.
+
+        int2 アロケータは `torch.unique(idx // N_Q)` でページ単位に畳むので、
+        行と slack を**別々の free() に分けると同じページを二重解放する**。
+        必ず1回の free() に束ねること。
+        """
+        slack = req.mixed_kv_quant_slack_indices
+        if slack.numel() == 0:
+            return indices
+
+        req.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
+        req.mixed_kv_quant_slack_cutoff_len = None
+        return torch.cat([indices.to(torch.int64), slack.to(indices.device)])
+
+    def _mixed_kv_slack_insert_limit(self, req: Req, key_len: int) -> int:
+        """Keep radix ownership below any request-owned partial quant page."""
+        cutoff_len = req.mixed_kv_quant_slack_cutoff_len
+        if cutoff_len is None:
+            return key_len
+        return max(0, min(key_len, int(cutoff_len)))
+
+    def _mixed_kv_tail_to_drop(self, committed_len: int) -> int:
+        # HP-recent slot ids are per-request and must not enter the tree.
+        if not self._mixed_kv_enabled:
+            return 0
+        kvcache = self._mixed_kv_pool
+        hp_prefix = int(kvcache.hp_prefix_tokens)
+        hp_recent = int(kvcache.hp_recent_tokens)
+        flush_overflow = max(1, int(kvcache.flush_interval)) - 1
+        if hp_recent <= 0 or committed_len <= hp_prefix:
+            return 0
+        trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
+        if self.page_size > 1:
+            trim = math.ceil(trim / self.page_size) * self.page_size
+        trim = min(trim, committed_len - hp_prefix)
+        return trim
+
+    def _mixed_kv_publish_limit(self, req: Req, cache_len: int) -> int:
+        """How far this request may publish into the tree under mixed KV.
+
+        `cache_len` はここに来るまでに mamba のチェックポイント境界
+        (`mamba_last_track_seqlen`) まで詰められている。そこへさらに
+        HP-recent の帯と、リクエストが部分所有する quant ページの境界を被せる。
+        page_size の倍数へ切り下げる(木とアロケータのページ境界を割らないため)。
+        """
+        if not self._mixed_kv_enabled or cache_len <= 0:
+            return cache_len
+        limit = cache_len - self._mixed_kv_tail_to_drop(cache_len)
+        limit = self._mixed_kv_slack_insert_limit(req, limit)
+        if self.page_size > 1:
+            limit = limit // self.page_size * self.page_size
+        return max(0, limit)
 
     ##### Public API #####
 
@@ -511,6 +600,33 @@ class MambaRadixCache(BasePrefixCache):
             than the last node's value.
         """
         key = self._match_pre_processor(params)
+        # mixed HP+int2 KV (PR #32129 移植 2026-09-19): 末尾の HP-recent 帯は
+        # リクエスト専有スロットなので木に載っていない。そこまで一致させようと
+        # すると他リクエストのスロットIDを掴む。cap して手前で止める。
+        # 内部の再マッチ(cache_unfinished_req の insert 後)は
+        # bypass_mixed_kv_cap=True を渡す: そこは cache_protected_len の
+        # 集合と一致している必要があり、cap すると `new_indices` が短くなって
+        # スロットIDを取りこぼす(リークする)。
+        if (
+            key is not None
+            and self._mixed_kv_enabled
+            and len(key) > 0
+            and not params.bypass_mixed_kv_cap
+        ):
+            n = len(key)
+            cap = min(
+                n,
+                max(
+                    self._mixed_kv_hp_prefix_tokens,
+                    n - self._mixed_kv_match_cap_overhead,
+                ),
+            )
+            if self.page_size > 1:
+                cap = cap // self.page_size * self.page_size
+            if cap < n:
+                key = key[:cap]
+            if len(key) == 0:
+                key = None
         if key is None:
             return MatchResult(
                 device_indices=torch.empty(
@@ -558,6 +674,33 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :kv_len_to_handle
         ]
+
+        if self._mixed_kv_enabled:
+            # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+            # mixed では木を育てるのは `cache_unfinished_req` だけにする。
+            # 終了・リトラクトのどちらでも、ここでは末尾を解放して
+            # dec_lock_ref するだけで、木は伸ばさない。
+            #
+            # 「insert して bypass 再マッチして inc_lock_ref(new) →
+            #  dec_lock_ref(old)」という素直な形は retract と併用すると危険で、
+            # 新しい葉は lock_ref=0 のまま生まれるため、retract のメモリ圧で
+            # 即座に evict され、まだ生きている他リクエストの req_to_token が
+            # 指しているスロットIDを解放してしまう(読みが壊れて出力が化ける)。
+            # 上流PRの実装も同じ理由で early-return している。
+            protected = req.kv.cache_protected_len
+            tail = kv_indices[protected:]
+            assert (
+                req.kv.swa_evicted_seqlen == 0
+            ), "mixed-KV quant slack is not supported with SWA eviction"
+            # slack は末尾と同じ atomic quant ページを共有するので、
+            # **同じ free() 呼び出しに束ねる**(別々だと二重解放)。
+            self.token_to_kv_pool_allocator.free(
+                self._with_mixed_quant_slack(req, tail)
+            )
+            self.req_to_token_pool.free_mamba_cache(req)
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+            return
 
         if is_insert:
             if self.enable_mamba_extra_buffer:
@@ -692,6 +835,34 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
 
+        # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+        # 木に載せてよい上限は「末尾の HP-recent 帯」と
+        # 「リクエストが部分所有する quant ページ」の手前まで。
+        # ここで効かせるのは**現在の確定長に対する帯**であって、
+        # cache_len に対する帯ではない(帯は末尾にしか無い)。
+        #
+        # mamba のチェックポイントは「ちょうど cache_len の位置の SSM 状態」なので、
+        # 上限が cache_len を下回る場合は**この節点を作れない**(短い鍵に
+        # 長い位置のチェックポイントを貼ることになる)。その回は見送る。
+        # チェックポイント境界が HP-recent 帯の中に落ちた時だけ起きる。
+        # 見送っても mamba_last_track_seqlen は残すので、次の機会に再挑戦できる。
+        if self._mixed_kv_enabled:
+            publish_cap = len(token_ids) - self._mixed_kv_tail_to_drop(len(token_ids))
+            publish_cap = self._mixed_kv_slack_insert_limit(req, publish_cap)
+            if self.page_size > 1:
+                publish_cap = publish_cap // self.page_size * self.page_size
+            if cache_len > max(0, publish_cap):
+                global _MIXED_KV_PUBLISH_SKIPPED
+                _MIXED_KV_PUBLISH_SKIPPED += 1
+                logger.debug(
+                    "mixed-KV: checkpoint at %d is inside the HP-recent band "
+                    "(publish cap %d); skipping this publish (total %d)",
+                    cache_len,
+                    publish_cap,
+                    _MIXED_KV_PUBLISH_SKIPPED,
+                )
+                return _skip_cache_unfinished_req(req)
+
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
@@ -767,7 +938,10 @@ class MambaRadixCache(BasePrefixCache):
                     page_aligned_token_ids,
                     req.extra_key,
                     cache_salt=req.cache_salt,
-                )
+                ),
+                # 内部の再マッチ。cap すると cache_protected_len の集合とズレて
+                # スロットIDを取りこぼす(リークする)。
+                bypass_mixed_kv_cap=True,
             )
         )
         new_indices, new_last_node = (

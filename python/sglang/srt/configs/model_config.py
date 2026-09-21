@@ -374,6 +374,10 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
                 "InklingForConditionalGeneration",
+                # 2026-09-18 自前移植: escha W2 は VLM アーキだが重みに vision tower が
+                # 無い(テキスト専用ビルド)。0.5.15 のフォークも同様に無効化していた。
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -1520,6 +1524,9 @@ class ModelConfig:
             "quark_mxfp4",
         ]
         optimized_quantization_methods = [
+            # 2026-09-18 自前移植: escha の最適化カーネルは警告対象外
+            "escha",
+            "eschamoe",
             "fp8",
             "marlin",
             "modelopt_fp8",

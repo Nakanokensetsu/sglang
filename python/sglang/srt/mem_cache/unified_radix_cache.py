@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import math
 import threading
 import time
 from dataclasses import replace
@@ -13,6 +14,9 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
+from sglang.srt.mem_cache.unified_kv_pool import (
+    resolve_mixed_kv_pool_from_allocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -154,6 +158,17 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+# 2026-09-19 自前修正: 有効な mamba チェックポイントが無いまま長さ0で
+# insert しかけて飛ばした回数。0 より大きければ、この修正前は
+# ルートノードに SSM 状態が貼られていたということ。
+_ZERO_LEN_INSERT_SKIPPED = 0
+
+# mixed HP+int2 KV: mamba のチェックポイント境界が HP-recent 帯に落ちて
+# 公開を見送った回数。高止まりするなら SGLANG_MIXED_KV_RECENT_TOKENS を下げるか
+# mamba の track interval を上げる。
+_MIXED_KV_PUBLISH_SKIPPED = 0
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -276,10 +291,109 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_sum_rate_main_weighted": 0.0,
         }
 
+        # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+        # 木がキャッシュしてよいのは共有 HP-prefix と quant スロットだけ。
+        # リクエスト専有の HP-recent スロットは木に入れてはいけない
+        # (スロットIDがリクエスト間で衝突する。正しさの問題)。
+        # hybrid GDN では full-attention 側の KV が
+        # HybridLinearKVPool.full_kv_pool なので、ラッパ越しに解決する。
+        self._mixed_kv_enabled = False
+        self._mixed_kv_hp_prefix_tokens = 0
+        self._mixed_kv_match_cap_overhead = 0
+        kvc = resolve_mixed_kv_pool_from_allocator(self.token_to_kv_pool_allocator)
+        self._mixed_kv_pool = kvc
+        if kvc is not None:
+            self._mixed_kv_enabled = True
+            self._mixed_kv_hp_prefix_tokens = int(kvc.hp_prefix_tokens)
+            flush_overflow = max(0, int(kvc.flush_interval) - 1)
+            self._mixed_kv_match_cap_overhead = (
+                int(kvc.hp_recent_tokens) + flush_overflow
+            )
+
         self.reset()
         logger.info(
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
             f"Tree Core: {type(self.tree_core).__name__}"
+            + (" mixed-KV: ON" if self._mixed_kv_enabled else "")
+        )
+
+    # ===== mixed HP+int2 KV helpers (RadixCache / MambaRadixCache と同じ規約) =====
+
+    def _with_mixed_quant_slack(self, req, indices: torch.Tensor) -> torch.Tensor:
+        """Fold request-owned quant-page slack slots into the indices being freed.
+
+        int2 アロケータは `torch.unique(idx // N_Q)` でページ単位に畳むので、
+        行と slack を別々の free() に分けると**同じページを二重解放する**。
+        必ず1回の free() に束ねること。
+        """
+        slack = req.mixed_kv_quant_slack_indices
+        if slack.numel() == 0:
+            return indices
+
+        req.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
+        req.mixed_kv_quant_slack_cutoff_len = None
+        return torch.cat([indices.to(torch.int64), slack.to(indices.device)])
+
+    def _mixed_kv_slack_insert_limit(self, req, key_len: int) -> int:
+        """Keep radix ownership below any request-owned partial quant page."""
+        cutoff_len = req.mixed_kv_quant_slack_cutoff_len
+        if cutoff_len is None:
+            return key_len
+        return max(0, min(key_len, int(cutoff_len)))
+
+    def _mixed_kv_tail_to_drop(self, committed_len: int) -> int:
+        """HP-recent slot ids are per-request and must not enter the tree."""
+        if not self._mixed_kv_enabled:
+            return 0
+        kvcache = self._mixed_kv_pool
+        hp_prefix = int(kvcache.hp_prefix_tokens)
+        hp_recent = int(kvcache.hp_recent_tokens)
+        flush_overflow = max(1, int(kvcache.flush_interval)) - 1
+        if hp_recent <= 0 or committed_len <= hp_prefix:
+            return 0
+        trim = min(hp_recent + flush_overflow, committed_len - hp_prefix)
+        if self.page_size > 1:
+            trim = math.ceil(trim / self.page_size) * self.page_size
+        trim = min(trim, committed_len - hp_prefix)
+        return trim
+
+    def _mixed_kv_publish_limit(self, req, committed_len: int) -> int:
+        """How far this request may publish into the tree under mixed KV.
+
+        HP-recent の帯は**末尾にしか無い**ので、引く相手は必ず「現在の確定長」。
+        すでに短く詰めた値から引くと毎回上限割れする。
+        """
+        if not self._mixed_kv_enabled or committed_len <= 0:
+            return committed_len
+        limit = committed_len - self._mixed_kv_tail_to_drop(committed_len)
+        limit = self._mixed_kv_slack_insert_limit(req, limit)
+        if self.page_size > 1:
+            limit = limit // self.page_size * self.page_size
+        return max(0, limit)
+
+    def _free_kv_row_with_mixed_slack(self, req, ranges) -> None:
+        """`free_kv_row` の mixed-KV 版。
+
+        slack は行の末尾と同じ atomic quant ページを共有するので、
+        `free_kv_row` の分割解放には載せられない(同じページが2回戻る)。
+        slack があるときだけ1回の free() に束ねる。
+        mixed-KV は SWA と併用しないので、SWA の分割は不要。
+        """
+        if not self._mixed_kv_enabled or req.mixed_kv_quant_slack_indices.numel() == 0:
+            self.free_kv_row(req.kv, ranges)
+            return
+        assert (
+            req.kv.swa_evicted_seqlen == 0
+        ), "mixed-KV quant slack is not supported with SWA eviction"
+        row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        parts = [row[start:end].to(torch.int64) for start, end in ranges]
+        parts = [p for p in parts if p.numel() > 0]
+        if parts:
+            idx = torch.cat(parts) if len(parts) > 1 else parts[0]
+        else:
+            idx = torch.empty((0,), dtype=torch.int64, device=row.device)
+        self.token_to_kv_pool_allocator.free(
+            self._with_mixed_quant_slack(req, idx)
         )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
@@ -526,6 +640,33 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         if self.disable:
             return self.tree_core.empty_match_result
+        # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+        # 末尾の HP-recent 帯はリクエスト専有スロットなので木に載っていない。
+        # そこまで一致させようとすると他リクエストのスロットIDを掴む。
+        # 内部の再マッチ(`cache_unfinished_req` の insert 後)は
+        # `bypass_mixed_kv_cap=True` を渡す。そこは cache_protected_len の集合と
+        # 一致している必要があり、cap すると `new_indices` が短くなって
+        # スロットIDを取りこぼす(リークする)。
+        if (
+            self._mixed_kv_enabled
+            and params.key is not None
+            and len(params.key) > 0
+            and not params.bypass_mixed_kv_cap
+        ):
+            n = len(params.key)
+            cap = min(
+                n,
+                max(
+                    self._mixed_kv_hp_prefix_tokens,
+                    n - self._mixed_kv_match_cap_overhead,
+                ),
+            )
+            if self.page_size > 1:
+                cap = cap // self.page_size * self.page_size
+            if cap <= 0:
+                return self.tree_core.empty_match_result
+            if cap < n:
+                params = replace(params, key=params.key[:cap])
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
@@ -544,6 +685,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
+        # 上流 PR #38191 より(2026-09-19 取り込み)。空キーで insert ウォークを
+        # 開かない。tree core 側にも空キーガードはあるが、そちらは
+        # `last_device_node=root` を返すため、呼び出し側が
+        # **ロックを持っていないルートへ `req.last_node` を張り替えてしまう**
+        # (加えて長さ0の session ref が登録される)。ここで短絡する。
+        # `mamba_exist=True` は cleanup の規約に合わせたもの:
+        # params.mamba_value は**消費されていない**ので呼び出し側の
+        # `cleanup_after_caching_req` が解放する。
+        # なお `effective_cache_len > 0` でも page_aligned で 0 になる経路があり、
+        # mixed-KV では page_size が 1→N_Q(=8) になるぶんそちらが起きやすい。
+        if params.key is None or len(params.key) == 0:
+            return InsertResult(prefix_len=0, mamba_exist=True)
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         # Pump the resumable insert, applying each step's actions at its barrier.
@@ -852,6 +1005,29 @@ class UnifiedRadixCache(BasePrefixCache):
             req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
+        if self._mixed_kv_enabled:
+            # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+            # mixed では木を育てるのは `cache_unfinished_req` だけにする。
+            # 終了・リトラクトのどちらでも、ここでは末尾を解放して
+            # ロックを返すだけで、木は伸ばさない。
+            #
+            # 「insert して bypass 再マッチして inc_lock_ref(new) →
+            #  dec_lock_ref(old)」という素直な形は retract と併用すると危険で、
+            # 新しい葉は lock_ref=0 のまま生まれるため retract のメモリ圧で
+            # 即座に evict され、まだ生きている他リクエストの req_to_token が
+            # 指しているスロットIDを解放してしまう(読みが壊れて出力が化ける)。
+            # 上流PRの RadixCache 実装も同じ理由で early-return している。
+            self._free_kv_row_with_mixed_slack(
+                req, [(req.kv.cache_protected_len, kv_len_to_handle)]
+            )
+            if req.last_node is not None:
+                self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=True, insert_result=None, insert_params=None
+                )
+            return
+
         result = None
         insert_params = None
 
@@ -872,6 +1048,51 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
+
+            if effective_cache_len <= 0:
+                # === 2026-09-19 自前修正 ===
+                # `cache_unfinished_req` は `effective_cache_len <= 0` で insert を
+                # 飛ばすのに、こちらには同じガードが無かった。
+                #
+                # extra_buffer では `mamba_last_track_seqlen is None`(=有効な
+                # チェックポイントが無い)のとき MambaComponent の finished 分岐が
+                # `cache_len = 0` にしたうえで **mamba_value は設定する**。
+                # その結果:
+                #   1. radix_key が空になり insert がルートで止まる
+                #   2. `commit_insert_component_data` は is_new_leaf=False かつ
+                #      値未設定なら**ルートノードに mamba_value を貼る**
+                #   3. ルートは lock 対象外(`node is root` で早期 return)なので
+                #      保護もされず、evict のループもルートで止まる
+                #   4. 以後 0 トークン一致した冷たいリクエストが
+                #      `finalize_match_result_in_cache` の copy-on-write で
+                #      **その状態を初期 SSM 状態として拾う**
+                #      (`mamba_needs_clear = False` も一緒に立つ)
+                # エラーは一切出ず、出力だけが静かに壊れる。
+                # unfinished 側と同じく insert を飛ばす。
+                global _ZERO_LEN_INSERT_SKIPPED
+                _ZERO_LEN_INSERT_SKIPPED += 1
+                if (
+                    _ZERO_LEN_INSERT_SKIPPED == 1
+                    or _ZERO_LEN_INSERT_SKIPPED % 100 == 0
+                ):
+                    logger.info(
+                        "skipped a zero-length cache_finished_req insert "
+                        "(no valid mamba checkpoint); total %d",
+                        _ZERO_LEN_INSERT_SKIPPED,
+                    )
+                self.free_kv_row(
+                    req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)]
+                )
+                if req.last_node is not None:
+                    self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req,
+                        is_finished=True,
+                        insert_result=None,
+                        insert_params=insert_params,
+                    )
+                return
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -946,6 +1167,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=getattr(req, "priority", 0) or 0,
         )
         effective_cache_len = len(token_ids)
+        mamba_cache_len = None
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
@@ -955,6 +1177,32 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
+                if comp.component_type == ComponentType.MAMBA:
+                    mamba_cache_len = cl
+
+        # === mixed HP+int2 KV (PR #32129 移植 2026-09-19) ===
+        # 木に載せてよい上限は、末尾の HP-recent 帯と、リクエストが部分所有する
+        # quant ページの手前まで。引く相手は**現在の確定長**(帯は末尾にしかない)。
+        #
+        # mamba のチェックポイントは「ちょうど mamba_cache_len の位置の SSM 状態」
+        # なので、上限がそれを下回る場合は**この節点を作れない**
+        # (短い鍵に長い位置のチェックポイントを貼ることになる)。その回は見送る。
+        if self._mixed_kv_enabled:
+            publish_cap = self._mixed_kv_publish_limit(req, len(token_ids))
+            if mamba_cache_len is not None and mamba_cache_len > publish_cap:
+                global _MIXED_KV_PUBLISH_SKIPPED
+                _MIXED_KV_PUBLISH_SKIPPED += 1
+                if _MIXED_KV_PUBLISH_SKIPPED == 1 or _MIXED_KV_PUBLISH_SKIPPED % 100 == 0:
+                    logger.info(
+                        "mixed-KV: mamba checkpoint at %d is inside the HP-recent "
+                        "band (publish cap %d); skipping this publish (total %d)",
+                        mamba_cache_len,
+                        publish_cap,
+                        _MIXED_KV_PUBLISH_SKIPPED,
+                    )
+                effective_cache_len = 0
+            else:
+                effective_cache_len = min(effective_cache_len, publish_cap)
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -992,7 +1240,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        # 内部の再マッチ: cap すると cache_protected_len の集合とズレて
+        # スロットIDを取りこぼす(リークする)ので bypass する。
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, req=req, bypass_mixed_kv_cap=True)
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len

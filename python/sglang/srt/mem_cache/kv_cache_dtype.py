@@ -28,7 +28,7 @@ def configure_kv_cache_dtype(
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
-) -> tuple[Optional[str], torch.dtype]:
+) -> tuple[Optional[str], "torch.dtype | str"]:
     resolved_kv_cache_dtype: Optional[str] = None
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
@@ -77,6 +77,10 @@ def configure_kv_cache_dtype(
                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
                 "with CUDA 12.8+."
             )
+    elif server_args_kv_cache_dtype == "int2":
+        # 2026-09-18 自前移植: OSCAR int2 量子化KV。torch の dtype ではなく
+        # 文字列 "int2" のまま保持し、MHATokenToKVPool 側が明示的に分岐する。
+        kv_cache_dtype = "int2"
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 

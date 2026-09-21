@@ -365,6 +365,116 @@ class MambaPoolHost(HostKVCache):
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
     @staticmethod
+    def _debug_verify_lf_pf(
+        src_layers, dst, src_indices, dst_indices, num_layers, src_ptrs, item_size
+    ):
+        """転送直前の突き合わせ。SGLANG_DEBUG_MAMBA_TRANSFER=0 で無効化できる。"""
+        import os
+
+        if os.environ.get("SGLANG_DEBUG_MAMBA_TRANSFER", "1") == "0":
+            return
+        # 転送ごとに 48 層ぶん Python で回すと実測の邪魔になる。呼び出しの
+        # 「形」ごとに初回だけ検査する。幾何は実行中に変わらないので、これで
+        # 起動直後に食い違いを捕まえられる。
+        seen_sig = getattr(MambaPoolHost, "_debug_checked", None)
+        if seen_sig is None:
+            seen_sig = set()
+            MambaPoolHost._debug_checked = seen_sig
+        key = (tuple(dst.shape), item_size, num_layers)
+        if key in seen_sig:
+            return
+        seen_sig.add(key)
+        # (a) キャッシュしたレイヤ先頭ポインタ vs 現在の実体
+        cached = [int(x) for x in src_ptrs.tolist()]
+        live = [int(src_layers[i].data_ptr()) for i in range(num_layers)]
+        if cached != live:
+            bad = [i for i in range(num_layers) if cached[i] != live[i]]
+            raise AssertionError(
+                "mamba transfer: cached src_ptrs are stale for layers "
+                f"{bad[:8]} (of {num_layers}); "
+                f"cached[{bad[0]}]={cached[bad[0]]:#x} live={live[bad[0]]:#x}"
+            )
+        # (b) index の範囲
+        dev_slots = int(src_layers[0].shape[0])
+        # dst は [layer, slot, ...] か [slot, layer, ...] のどちらか。
+        # lf->pf なので dst は page_first = [slot, layer, ...]。
+        host_slots = int(dst.shape[0])
+        s_max = int(src_indices.max())
+        s_min = int(src_indices.min())
+        d_max = int(dst_indices.max())
+        d_min = int(dst_indices.min())
+        if not (0 <= s_min and s_max < dev_slots):
+            raise AssertionError(
+                f"mamba transfer: device index out of range [{s_min},{s_max}] "
+                f"vs device slots {dev_slots} (n={src_indices.numel()})"
+            )
+        if not (0 <= d_min and d_max < host_slots):
+            raise AssertionError(
+                f"mamba transfer: host index out of range [{d_min},{d_max}] "
+                f"vs host slots {host_slots} (n={dst_indices.numel()}), "
+                f"dst.shape={tuple(dst.shape)}"
+            )
+        if src_indices.numel() != dst_indices.numel():
+            raise AssertionError(
+                f"mamba transfer: index count mismatch "
+                f"{src_indices.numel()} vs {dst_indices.numel()}"
+            )
+        # (c) カーネルが要求する条件と、dst の1スロット幅
+        dst_slot_bytes = int(dst[0].numel() * dst.element_size())
+        if dst_slot_bytes != item_size * num_layers:
+            raise AssertionError(
+                f"mamba transfer: dst slot is {dst_slot_bytes}B but kernel writes "
+                f"item_size*num_layers={item_size * num_layers}B "
+                f"(item_size={item_size}, num_layers={num_layers}, "
+                f"dst.shape={tuple(dst.shape)})"
+            )
+        # (d) ストライド。カーネルは
+        #       src = layer_ptrs[l] + src_idx * item_size
+        #       dst = dst_base + dst_idx * dst_layout_dim + l * item_size
+        #     と番地を組むので、どちらも「連続 + スロット幅 = item_size」が前提。
+        #     スライスやビューだとここが崩れて範囲外を踏む。
+        src0 = src_layers[0]
+        for i in range(num_layers):
+            t = src_layers[i]
+            st = int(t.stride(0) * t.element_size())
+            if st != item_size or not t.is_contiguous():
+                raise AssertionError(
+                    f"mamba transfer: device layer {i} not tightly packed: "
+                    f"stride(0)={st}B vs item_size={item_size}B, "
+                    f"contiguous={t.is_contiguous()}, shape={tuple(t.shape)}"
+                )
+        src_slot_stride = int(src0.stride(0) * src0.element_size())
+        dst_slot_stride = int(dst.stride(0) * dst.element_size())
+        if src_slot_stride != item_size or not src0.is_contiguous():
+            raise AssertionError(
+                f"mamba transfer: device tensor is not tightly packed: "
+                f"stride(0)={src_slot_stride}B vs item_size={item_size}B, "
+                f"contiguous={src0.is_contiguous()}, shape={tuple(src0.shape)}"
+            )
+        if dst_slot_stride != item_size * num_layers or not dst.is_contiguous():
+            raise AssertionError(
+                f"mamba transfer: host tensor is not tightly packed: "
+                f"stride(0)={dst_slot_stride}B vs "
+                f"item_size*num_layers={item_size * num_layers}B, "
+                f"contiguous={dst.is_contiguous()}, shape={tuple(dst.shape)}"
+            )
+        # 初回だけ実際の値を出す。推測でなく数字で見るため。
+        if True:
+            logger.info(
+                "mamba transfer host buffer: shape=%s pinned=%s registered=%s",
+                tuple(dst.shape), dst.is_pinned(),
+                hasattr(dst, "_sglang_cuda_host_registered_ranges"),
+            )
+            logger.info(
+                "mamba transfer geometry: num_layers=%d item_size=%dB "
+                "device[shape=%s slots=%d] host[shape=%s slots=%d stride0=%dB] "
+                "src_idx=[%d,%d] dst_idx=[%d,%d] n=%d",
+                num_layers, item_size, tuple(src0.shape), dev_slots,
+                tuple(dst.shape), host_slots, dst_slot_stride,
+                s_min, s_max, d_min, d_max, src_indices.numel(),
+            )
+
+    @staticmethod
     def _copy_tensor_all_layers_lf_pf(
         src_layers: torch.Tensor,
         dst: torch.Tensor,
@@ -386,6 +496,17 @@ class MambaPoolHost(HostKVCache):
             # Move dst_indices to CUDA here to satisfy the kernel's requirement.
             if dst_indices.device.type != "cuda":
                 dst_indices = dst_indices.to(src_indices.device, non_blocking=True)
+            # 2026-09-20 自前追加(調査用): この経路が
+            # transfer_mamba.cuh:184 で illegal memory access を出す。
+            # カーネルは src_ptrs(起動時にキャッシュしたレイヤ先頭ポインタ)と
+            # 2つの index 列だけを見るので、容疑は
+            #   (a) キャッシュしたポインタが現在のテンソルと食い違っている
+            #   (b) index が範囲外
+            # の2つ。発射前に両方を突き合わせる。
+            MambaPoolHost._debug_verify_lf_pf(
+                src_layers, dst, src_indices, dst_indices, num_layers,
+                src_ptrs, item_size,
+            )
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
                 dst=dst,

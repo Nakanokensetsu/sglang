@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
@@ -104,6 +105,13 @@ class SchedulerInvariantChecker:
             total = self.req_to_token_pool.schedulable_token_capacity(
                 self.token_to_kv_pool_allocator.size
             )
+        elif isinstance(self.token_to_kv_pool_allocator, UnifiedInt2HPKVAllocator):
+            # Mixed HP+int2 KV: the allocator's ``size`` includes the shared
+            # HP-prefix pool, which max_total_num_tokens (quant tokens only)
+            # does not cover.
+            protected = self.tree_cache.protected_size()
+            session_held = self.pool_stats_observer.session_held_tokens()
+            total = self.token_to_kv_pool_allocator.size
         else:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()

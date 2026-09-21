@@ -1252,6 +1252,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
 
+            # 2026-09-19: thinking_budget の配線(上流 #25536)。
+            self._autowire_thinking_budget(obj)
+
+
+    def _autowire_thinking_budget(self, obj) -> None:
+        """custom_params.thinking_budget があるのに custom_logit_processor が
+        未指定のリクエストへ、このモデル用の思考予算プロセッサを割り当てる。
+        既に指定がある / 機能無効 / 解決不能 のときは何もしない。"""
+        try:
+            if getattr(obj, "custom_logit_processor", None):
+                return
+            if not get_exec().features.enable_custom_logit_processor:
+                return
+            sp = getattr(obj, "sampling_params", None)
+            sp_list = sp if isinstance(sp, list) else [sp]
+            if not any(
+                isinstance(x, dict)
+                and isinstance(x.get("custom_params"), dict)
+                and x["custom_params"].get("thinking_budget") is not None
+                for x in sp_list
+            ):
+                return
+            from sglang.srt.sampling.custom_logit_processor import (
+                resolve_thinking_budget_processor,
+            )
+
+            cls = resolve_thinking_budget_processor(self.tokenizer)
+            if cls is None:
+                return
+            obj.custom_logit_processor = cls.to_str()
+        except Exception:
+            pass
+
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:

@@ -1802,6 +1802,34 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+        # モデル dtype(fp16)へ揃える。
+        weights = [
+            (_n, _w.to(torch.float16)
+             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            for _n, _w in weights
+        ]
+        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+        # 出力が一様ロジット("!!!!" のゴミ)になる。
+        weights = list(weights)
+        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+            _ibuf, _iout = {}, []
+            for _n, _w in weights:
+                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+                    _b = _n.rsplit(".", 1)[0]
+                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
+                        _iout.append((_b + ".weight",
+                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        del _ibuf[_b]
+                else:
+                    _iout.append((_n, _w))
+            weights = _iout
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1891,6 +1919,34 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+        # モデル dtype(fp16)へ揃える。
+        weights = [
+            (_n, _w.to(torch.float16)
+             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            for _n, _w in weights
+        ]
+        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+        # 出力が一様ロジット("!!!!" のゴミ)になる。
+        weights = list(weights)
+        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+            _ibuf, _iout = {}, []
+            for _n, _w in weights:
+                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+                    _b = _n.rsplit(".", 1)[0]
+                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
+                        _iout.append((_b + ".weight",
+                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        del _ibuf[_b]
+                else:
+                    _iout.append((_n, _w))
+            weights = _iout
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2157,6 +2213,34 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+        # モデル dtype(fp16)へ揃える。
+        weights = [
+            (_n, _w.to(torch.float16)
+             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            for _n, _w in weights
+        ]
+        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+        # 出力が一様ロジット("!!!!" のゴミ)になる。
+        weights = list(weights)
+        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+            _ibuf, _iout = {}, []
+            for _n, _w in weights:
+                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+                    _b = _n.rsplit(".", 1)[0]
+                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
+                        _iout.append((_b + ".weight",
+                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        del _ibuf[_b]
+                else:
+                    _iout.append((_n, _w))
+            weights = _iout
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2327,6 +2411,34 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
+        # 2026-09-18 自前移植: escha は fp16 で動くが、非量子化層(conv1d / in_proj_a /
+        # in_proj_b / 各 norm)はチェックポイントに bf16 で焼かれている。0.5.19 の
+        # causal_conv1d triton カーネルは重みと入力の dtype 一致を要求するため、
+        # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
+        # モデル dtype(fp16)へ揃える。
+        weights = [
+            (_n, _w.to(torch.float16)
+             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            for _n, _w in weights
+        ]
+        # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
+        # escha の int8 embed/lm_head は {.weight_int8 + .weight_scale} で保存されている。
+        # これを fp16 の .weight へ戻さないと embed_tokens/lm_head が未ロードのままになり、
+        # 出力が一様ロジット("!!!!" のゴミ)になる。
+        weights = list(weights)
+        if any(_n.endswith(".weight_int8") for _n, _ in weights):
+            _ibuf, _iout = {}, []
+            for _n, _w in weights:
+                if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
+                    _b = _n.rsplit(".", 1)[0]
+                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
+                        _iout.append((_b + ".weight",
+                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        del _ibuf[_b]
+                else:
+                    _iout.append((_n, _w))
+            weights = _iout
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

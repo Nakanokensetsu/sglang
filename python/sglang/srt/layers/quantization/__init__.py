@@ -76,7 +76,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 # Base quantization methods
+# 2026-09-18 自前移植: escha 2bit量子化(escha 1.2.2 wheel 由来)
+from sglang.srt.layers.quantization.escha import DIEschaConfig
+from sglang.srt.layers.quantization.eschamoe import DIEschaMoEConfig
+
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
+    "escha": DIEschaConfig,
+    "eschamoe": DIEschaMoEConfig,
     "fp8": Fp8Config,
     "mxfp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,

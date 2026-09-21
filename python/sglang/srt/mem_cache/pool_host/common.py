@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 from collections import defaultdict
 
 import torch
@@ -158,9 +159,16 @@ def _cuda_host_register(
             ptr = base + offset
             rc = int(cudart.cudaHostRegister(ptr, size, 0))
             if rc != 0:
+                # 2026-09-20 自前修正: cudaGetErrorString は
+                # torch._C._cudart.cudaError しか受け取らない。int を渡すと
+                # TypeError になり、**本来の失敗理由が握り潰される**。
+                try:
+                    rc_msg = cudart.cudaGetErrorString(cudart.cudaError(rc))
+                except Exception:
+                    rc_msg = "unknown"
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                    f"{rc_msg}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
                 )
@@ -251,8 +259,80 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def _host_register_is_mappable() -> bool:
+    """``cudaHostRegister`` した領域をカーネルが直接触れるか。
+
+    2026-09-20 自前追加。HiCache の mamba バックアップカーネル
+    (``transfer_mamba.cuh`` の ``transfer_mamba_backup_kernel``)は、
+    ホストプールの**ホストポインタへ GPU から直接ストア**する。これは登録領域が
+    デバイスのアドレス空間にマップされていることが前提になる。
+
+    **WSL2 ではこの前提が成り立たない。** malloc したホストメモリは
+    ``cudaHostRegister`` しても(flags を Default/Portable/Mapped/両方の
+    どれにしても)マップされず、カーネルが触った瞬間に
+    ``illegal memory access`` になる。``cudaHostAlloc``(= torch の
+    ``pin_memory=True``)で確保したものは問題なく触れる。実測で切り分け済み:
+
+        dst=GPU              -> OK
+        dst=torch pin_memory -> OK
+        dst=cudaHostRegister -> illegal memory access (flags 0/1/2/3 全滅)
+        dst=未ピン            -> illegal memory access
+
+    再現手順は ``tools/mamba_transfer_repro.py``。
+
+    ``SGLANG_HICACHE_HOST_ALLOC`` で明示上書きできる(``pin`` / ``register``)。
+    """
+    override = os.environ.get("SGLANG_HICACHE_HOST_ALLOC", "").strip().lower()
+    if override == "pin":
+        return False
+    if override == "register":
+        return True
+    # WSL 判定。マイクロソフトのカーネルは release に "microsoft" を含む。
+    try:
+        return "microsoft" not in platform.uname().release.lower()
+    except Exception:
+        return True
+
+
+def _alloc_cuda_host(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    if _host_register_is_mappable():
+        return alloc_with_host_register(
+            dims, dtype, device, pin_memory, allocator,
+            registration_granularity_bytes,
+        )
+    # cudaHostAlloc 経路。``allocator``(mmap/shm)は使えないので、
+    # 別アロケータを要求されている場合は黙って無視せず落とす。
+    allocator_name = type(allocator).__name__ if allocator is not None else "None"
+    # 既定の ``HostTensorAllocator`` は torch.empty を呼ぶだけなので
+    # cudaHostAlloc 経路で置き換えられる。mmap/shm/mooncake 等は置き換えられない。
+    if allocator is not None and allocator_name != "HostTensorAllocator":
+        raise RuntimeError(
+            "HiCache on this platform must allocate host pools with "
+            f"cudaHostAlloc, which cannot use the {allocator_name} allocator "
+            "(--hicache-storage-backend shm/... is unsupported here). "
+            "Set SGLANG_HICACHE_HOST_ALLOC=register to override at your own risk."
+        )
+    if not getattr(_alloc_cuda_host, "_logged", False):
+        _alloc_cuda_host._logged = True
+        logger.info(
+            "HiCache host pools use cudaHostAlloc (pin_memory) instead of "
+            "cudaHostRegister: registered host memory is not device-mappable "
+            "on this platform (WSL2). Override with SGLANG_HICACHE_HOST_ALLOC."
+        )
+    return alloc_with_pin_memory(
+        dims, dtype, device, pin_memory, None, registration_granularity_bytes
+    )
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
+    lambda: _alloc_cuda_host,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,

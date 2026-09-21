@@ -1,3 +1,34 @@
+> ### This fork: Escha-W2 (2-bit dense) + OSCAR INT2 KV + HiCache on 2x 12 GB
+>
+> **A 27B model with a 131,072-token context and a 210,000-token KV pool,
+> serving 8-10 concurrent users, on two 12 GB consumer GPUs.**
+>
+> | | |
+> |---|---|
+> | Model | [Qwen3.8-27B-Escha-W2](https://huggingface.co/centraly/Qwen3.8-27B-Escha-W2) - 2-bit dense, hybrid GDN + full attention |
+> | Runtime | stock [**v0.5.19**](https://github.com/sgl-project/sglang/releases/tag/v0.5.19) + this branch ([`escha-0519-base`](../../tree/escha-0519-base) is the untouched tag) |
+> | KV cache | OSCAR INT2 ([PR #32129](https://github.com/sgl-project/sglang/pull/32129)) + **HiCache L2 in host RAM** |
+> | VRAM | 10.1 GB idle / 11.1 GB at full prefill, of 12.0 GB per card |
+> | Context | 131,072 - KV pool **210,000 tokens** - concurrency 10 |
+> | Speed | cold prefill **964 tok/s** - decode 50.7 tok/s - 8 concurrent, second pass **1.6 s** (5.2 s without HiCache) |
+>
+> **-> [`escha_0519/README.md`](escha_0519/README.md)** - the launch line in
+> full, why each number is what it is, and how to tell when it is wrong.
+>
+> Found on the way: the long-context ceiling was the **KV pool, not the mamba
+> cache** (3 users x 66K revisiting: 12.4 % / 57 s -> 99.9 % / 0.3 s) -
+> HiCache dies on a **hybrid GDN** model because a kernel cannot store to
+> `cudaHostRegister`ed host memory under **WSL2** - the INT2 host pool
+> disagreed with itself about how wide a token is (192 B vs 512 B vs 128 B) -
+> `--hicache-ratio 2` pins 10.3 GB of host RAM and makes a 32 GB machine swap.
+>
+> The 0.5.15 MoE setup this fork started from is on
+> [`escha-oscar-int2`](../../tree/escha-oscar-int2).
+>
+> Everything below is the upstream SGLang README.
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

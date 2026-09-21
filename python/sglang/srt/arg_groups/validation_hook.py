@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -105,6 +106,55 @@ def check_server_args(server_args: Any):
         assert (
             cfg.chunked_prefill_size % cfg.page_size == 0
         ), "chunked_prefill_size must be divisible by page_size"
+
+    # --- PR #32129 移植 2026-09-19: int2 KV の組み合わせ検証 ---
+    # 上流PRでは ServerArgs.check_server_args 本体にあったが、0.5.19 では
+    # 検証が arg_groups/validation_hook.py に集約されたのでここへ再配置。
+    if cfg.kv_cache_quant_group_size is not None:
+        if cfg.kv_cache_quant_group_size <= 0:
+            raise ValueError("--kv-cache-quant-group-size must be positive")
+        if cfg.kv_cache_dtype != "int2":
+            raise ValueError(
+                "--kv-cache-quant-group-size is only supported with "
+                "--kv-cache-dtype int2"
+            )
+        if cfg.model_path.lower() not in ["none", "dummy"] and getattr(
+            model_config_of(cfg), "is_hybrid_swa", False
+        ):
+            raise ValueError(
+                "--kv-cache-quant-group-size is only supported for the "
+                "full-attention int2 KV cache path (Triton backend, or "
+                "hybrid FA3-prefill + Triton-decode) and is not "
+                "supported with hybrid SWA models"
+            )
+
+    # int2 has no FA3 decode reader path; it lives only in the Triton
+    # backend. FA3 prefill is supported via HybridAttnBackend
+    # (--prefill-attention-backend fa3 --decode-attention-backend
+    # triton), but sending decode to FA3 with int2 would crash in
+    # forward_decode (``q.to("int2")``). Reject the unsupported
+    # combinations up front so we fail at startup with a clear message
+    # rather than a cryptic TypeError mid-forward.
+    if cfg.kv_cache_dtype == "int2":
+        bad_backend = None
+        if (
+            cfg.attention_backend not in (None, "triton")
+            and cfg.prefill_attention_backend is None
+            and cfg.decode_attention_backend is None
+        ):
+            bad_backend = f"--attention-backend {cfg.attention_backend}"
+        elif (
+            cfg.decode_attention_backend is not None
+            and cfg.decode_attention_backend != "triton"
+        ):
+            bad_backend = f"--decode-attention-backend {cfg.decode_attention_backend}"
+        if bad_backend is not None:
+            raise ValueError(
+                "--kv-cache-dtype int2 requires the Triton decode path. "
+                f"Got {bad_backend}. Use either `--attention-backend "
+                "triton` or `--prefill-attention-backend fa3 "
+                "--decode-attention-backend triton`."
+            )
 
     # Check pdmux
     if cfg.enable_pdmux:
