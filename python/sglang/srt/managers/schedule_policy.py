@@ -499,6 +499,7 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         long_prefill_token_threshold: int = 0,
         max_concurrent_chunked_reqs: int = 1,
+        num_carried_chunked_reqs: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -604,6 +605,7 @@ class PrefillAdder:
         # up to chunked_prefill_size // threshold requests can be mid-prefill
         # concurrently. 0 disables the cap (one request may drain the pool).
         self.long_prefill_token_threshold = long_prefill_token_threshold
+        self.num_carried_chunked_reqs = num_carried_chunked_reqs
         # How many requests may be mid-prefill at once. Mid-prefill requests
         # pin their computed KV and cannot be retracted, so the bound also
         # caps the reserved-but-uncomputed KV held for them.
@@ -765,6 +767,29 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+
+    def _effective_long_prefill_ceiling(self) -> int:
+        """The per-request prefill ceiling to apply this pass (0 = none).
+
+        2026-09-21 自前追加。上流 PR #34623 は ``long_prefill_token_threshold``
+        を**無条件に**適用するので、作者自身が書いているとおり
+        「待機がいない長文 prefill も F に絞られ、予算を遊ばせたまま B/F 倍
+        遅くなる」(PR 本文 "Known trade-off")。
+
+        譲る相手がいないときに絞る理由はない。待機中の要求があるか、他にも
+        prefill 途中の要求がいるときだけ上限をかける。invariant 側
+        (容量・予約) は無条件のまま触らない: 上限を外した回は長文が予算を
+        使い切るので、そもそも新しいチャンク要求が生まれず容量を超えない。
+
+        ``SGLANG_LONG_PREFILL_CEILING_ALWAYS=1`` で上流どおりの無条件適用に戻せる。
+        """
+        F = self.long_prefill_token_threshold
+        if F <= 0:
+            return 0
+        if os.environ.get("SGLANG_LONG_PREFILL_CEILING_ALWAYS", "") == "1":
+            return F
+        contended = self.waiting_queue_len > 0 or self.num_carried_chunked_reqs > 1
+        return F if contended else 0
 
     def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
         """Largest page-aligned extend chunk the SWA pool can admit right now,
@@ -1058,8 +1083,9 @@ class PrefillAdder:
 
             # Per-request ceiling, applied to continued chunks as well: one
             # carried request cannot drain the pool ahead of the others.
-            if self.long_prefill_token_threshold > 0:
-                _rem_tokens = min(_rem_tokens, self.long_prefill_token_threshold)
+            _ceiling = self._effective_long_prefill_ceiling()
+            if _ceiling > 0:
+                _rem_tokens = min(_rem_tokens, _ceiling)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1205,10 +1231,9 @@ class PrefillAdder:
         # in add_one_req: applied before the chunked/non-chunked split, so a
         # request under the ceiling still admits whole.
         chunk_tokens_limit = self.rem_chunk_tokens
-        if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
-            chunk_tokens_limit = min(
-                chunk_tokens_limit, self.long_prefill_token_threshold
-            )
+        _ceiling = self._effective_long_prefill_ceiling()
+        if _ceiling > 0 and chunk_tokens_limit is not None:
+            chunk_tokens_limit = min(chunk_tokens_limit, _ceiling)
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
@@ -1399,7 +1424,8 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
-            if self.long_prefill_token_threshold > 0 and chunk_tokens_limit is not None:
+            _ceiling = self._effective_long_prefill_ceiling()
+            if _ceiling > 0 and chunk_tokens_limit is not None:
                 # vLLM-compatible per-request ceiling: no request prefills
                 # more than the threshold in one pass, so up to
                 # chunked_prefill_size // threshold requests can be
@@ -1408,9 +1434,7 @@ class PrefillAdder:
                 # chunked/non-chunked split, so a request whose whole
                 # remaining prompt fits under the threshold still admits
                 # whole rather than being chunked by the ceiling.
-                chunk_tokens_limit = min(
-                    chunk_tokens_limit, self.long_prefill_token_threshold
-                )
+                chunk_tokens_limit = min(chunk_tokens_limit, _ceiling)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back

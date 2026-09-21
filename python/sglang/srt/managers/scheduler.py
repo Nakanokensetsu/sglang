@@ -3771,6 +3771,9 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             long_prefill_token_threshold=get_schedule().long_prefill_token_threshold,
             max_concurrent_chunked_reqs=self.max_concurrent_chunked_reqs,
+            # 2026-09-21 自前追加: 上限を「譲る相手がいるときだけ」かけるための材料。
+            # この時点の chunked_reqs は前パスからの持ち越し集合そのもの。
+            num_carried_chunked_reqs=len(self.chunked_reqs),
         )
 
         # Re-admit the requests carried over from earlier passes, oldest first,
