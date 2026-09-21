@@ -509,6 +509,8 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        # 2026-09-22 自前追加: 均等配分の分母に使う、このパスの元の予算。
+        self.chunk_budget_total = rem_chunk_tokens
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -786,10 +788,30 @@ class PrefillAdder:
         F = self.long_prefill_token_threshold
         if F <= 0:
             return 0
-        if os.environ.get("SGLANG_LONG_PREFILL_CEILING_ALWAYS", "") == "1":
-            return F
+        _ALWAYS = os.environ.get("SGLANG_LONG_PREFILL_CEILING_ALWAYS", "") == "1"
         contended = self.waiting_queue_len > 0 or self.num_carried_chunked_reqs > 1
-        return F if contended else 0
+        if not contended:
+            # 2026-09-22: 非競合でも上限で刻む。単独巡航中に予算8192を丸ごと使うと、
+            # 後から来た要求が「進行中パスの残り」を最大6.7秒待つ。F=2048 の刻みでも
+            # スループットは 1,276 tok/s で 8192 と同じ(実測)なので、刻む損は無い。
+            return F if _ALWAYS else 0
+
+        # 2026-09-22 自前追加: 予算を「いま prefill 中の本数 + 待っている本数」で
+        # 均等に割る。1本しかいなければ予算を丸ごと使うので隙間は生まれず、
+        # 新規が来た瞬間に全員の取り分が自動で縮む。F はその上限として残す
+        # (上限を外すと1本あたりが大きくなりすぎ、後から来た要求の待ちが延びる)。
+        if self.chunk_budget_total:
+            n_active = max(
+                1, self.num_carried_chunked_reqs + max(self.waiting_queue_len, 0)
+            )
+            # 2026-09-22: 本数でちょうど割ると1本あたりが大きすぎ、後から来た要求が
+            # 進行中パスの残りを長く待つ。セッション数に倍率をかけて更に細かく刻む
+            # (既定2 = セッション数の倍で割る)。SGLANG_PREFILL_SPLIT_FACTOR で変更可。
+            _k = os.environ.get("SGLANG_PREFILL_SPLIT_FACTOR", "").strip()
+            _k = int(_k) if _k.isdigit() and int(_k) >= 1 else 1
+            share = max(self.page_size, self.chunk_budget_total // (n_active * _k))
+            return min(F, share)
+        return F
 
     def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
         """Largest page-aligned extend chunk the SWA pool can admit right now,
@@ -1105,7 +1127,16 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
-        reserving = self.long_prefill_token_threshold > 0 and self.dllm_config is None
+        # 2026-09-21 自前修正: 上流 #34623 は F>0 なら**無条件に**完走分を先取りする。
+        # 予約が要るのは「チャンク分割されて preempt できなくなる要求」だけで、
+        # 1パスで丸ごと収まる要求(キャッシュヒットした再訪など)には不要。
+        # 無条件にすると並列時の受理が絞られ、実測で並列8の再訪 最遅が
+        # 0.5秒 -> 15.0秒 に悪化した。truncated のときだけ予約する。
+        reserving = (
+            self.long_prefill_token_threshold > 0
+            and self.dllm_config is None
+            and truncated
+        )
         self._update_prefill_budget(
             0,
             req.extend_range.length,
