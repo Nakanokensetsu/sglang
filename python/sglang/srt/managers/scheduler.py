@@ -1320,6 +1320,33 @@ class Scheduler(
         requests). Speculative decoding needs no gate: DSpark/EAGLE track
         per-request state and never read the slot count.
         """
+        # 2026-09-22 自前追加: 同時に面倒を見るセッション数 N を入口にする。
+        # 予算 chunked_prefill_size を N 等分したものが1本あたりの取り分 F になり、
+        # N 本そろえば隙間なく予算を使い切る。F を直に決めるより意図が明確で、
+        # chunked_prefill_size を変えても N は据え置きで済む。
+        # 既定は並列設定 (max_running_requests) にそのまま紐付ける。並列数を
+        # 変えれば取り分も自動で追従するので、設定が二重に増えない。
+        _n = os.environ.get("SGLANG_PREFILL_CONCURRENCY", "").strip()
+        # 既定は「並列セッション制限数 x 2」。制限いっぱいまで同時に走っても
+        # 予算が足り、かつ1本あたりが小さいので後から来た要求の待ちが短い。
+        if not _n.isdigit() and self.max_running_requests:
+            _n = str(max(1, int(self.max_running_requests) * 2))
+        # さらに細かく刻みたいときの分割係数 K。F = 予算 / (N * K)。
+        # 小さいほど短文の待ちは縮むが、パス数が増えて長文の prefill が落ちる
+        # (実測: F=1024 で 1,216 tok/s、F=512 で 1,098 tok/s = -14%)。
+        _k = os.environ.get("SGLANG_PREFILL_SPLIT_FACTOR", "").strip()
+        _k = int(_k) if _k.isdigit() and int(_k) >= 1 else 1
+        if _n.isdigit() and int(_n) >= 1 and self.chunked_prefill_size:
+            _n = int(_n)
+            _derived = max(1, self.chunked_prefill_size // (_n * _k))
+            get_context().override(
+                "prefill_concurrency", long_prefill_token_threshold=_derived
+            )
+            logger.info(
+                f"Prefill concurrency N={_n}: long_prefill_token_threshold="
+                f"{_derived} (chunked_prefill_size={self.chunked_prefill_size})."
+            )
+
         threshold = get_schedule().long_prefill_token_threshold
         if (
             threshold <= 0
@@ -3813,6 +3840,10 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # 2026-09-22 自前追加: 容量で弾かれた要求の後ろを何本まで見るか。
+        _overtake_budget = (
+            16 if os.environ.get("SGLANG_ADMIT_OVERTAKE", "") == "1" else 0
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3880,6 +3911,31 @@ class Scheduler(
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            if (
+                res != AddReqResult.CONTINUE
+                and os.environ.get("SGLANG_DEBUG_ADMIT", "") == "1"
+            ):
+                # 受理されなかった理由と予算の内訳を出す診断ログ(既定OFF)。
+                # 「容量で弾かれた要求の後ろが検査されない」の特定に使った。
+                _need = len(req.full_untruncated_fill_ids) - len(
+                    req.prefix_indices
+                )
+                _allocatable = self.get_num_allocatable_reqs(
+                    len(running_batch.reqs), running_batch=running_batch
+                )
+                _chunked = len(self.chunked_reqs) + len(adder.new_chunked_reqs)
+                logger.info(
+                    f"[ADMIT] rid={req.rid[:8]} res={res} need={_need} "
+                    f"cur_rem={adder.cur_rem_tokens} "
+                    f"rem_total={int(adder.rem_total_tokens)} "
+                    f"rem_input={adder.rem_input_tokens} "
+                    f"rem_chunk={adder.rem_chunk_tokens} "
+                    f"rem_mamba={adder.rem_mamba_slots} "
+                    f"chunked={_chunked}/{self.max_concurrent_chunked_reqs} "
+                    f"can_run={len(adder.can_run_list)} "
+                    f"allocatable={_allocatable}"
+                )
+
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -3907,6 +3963,15 @@ class Scheduler(
                 if res == AddReqResult.SKIP:
                     # Only the mid-prefill capacity is full; later waiting
                     # requests may still fit and must keep being considered.
+                    continue
+                if res == AddReqResult.NO_TOKEN and _overtake_budget > 0:
+                    # 2026-09-22 自前追加: この要求は「残りプール全部を確保できるか」
+                    # で落ちただけで、プールが尽きたわけではない(完走予約により
+                    # 先客の残量が引かれている)。ここで break すると、後ろに並んだ
+                    # 小さな要求が検査すらされず待たされる(実測 TTFT 109 秒)。
+                    # FCFS は崩すが、入れる要求だけを先に通す。
+                    _overtake_budget -= 1
+                    running_batch.batch_is_full = False
                     continue
                 break
 
