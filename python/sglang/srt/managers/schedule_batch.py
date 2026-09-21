@@ -1069,6 +1069,16 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # Unused slots owned by partially occupied atomic quant pages in the
+        # mixed HP+int2 KV path. They are not logical token positions, but must
+        # be freed with the request-owned live tail slots to return the page.
+        self.mixed_kv_quant_slack_indices: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int64
+        )
+        # Smallest logical token position whose atomic quant page has
+        # request-owned slack. Radix insertion must stay below this boundary
+        # until the request frees the page as a whole.
+        self.mixed_kv_quant_slack_cutoff_len: Optional[int] = None
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
@@ -1766,6 +1776,8 @@ class Req(ReqDllmMixin):
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.mixed_kv_quant_slack_indices = torch.empty((0,), dtype=torch.int64)
+        self.mixed_kv_quant_slack_cutoff_len = None
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
@@ -1994,17 +2006,24 @@ def mamba_lazy_spec_in_window(
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
 
 
-def set_mamba_track_indices_from_reqs(
-    batch, track_positions: Optional[List[int]] = None
+def mamba_track_indices_from_reqs(
+    *,
+    req_to_token_pool,
+    req_pool_indices: torch.Tensor,
+    reqs: List[Req],
+    track_positions: Optional[List[int]] = None,
 ):
-    """Build mamba_track_indices from req objects (authoritative source).
+    """Per-req ping-pong slot ids for this forward, from the req objects
+    (authoritative source): ``(track_positions, mamba_track_indices)``.
 
     track_positions: optional per-req ping-pong position override (the lazy
     spec track plan, see mamba_lazy_spec_prepare).
+
+    上流 PR #39526 より(2026-09-19 取り込み)。MIXED バッチ用に
+    「バッチに書き込まない純関数」へ分離したもの。
     """
-    req_to_token_pool = batch.req_to_token_pool
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
+        req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
@@ -2016,20 +2035,32 @@ def set_mamba_track_indices_from_reqs(
                 if req.kv.mamba_next_track_idx is not None
                 else 0
             )
-            for req in batch.reqs
+            for req in reqs
         ]
-    batch.mamba_track_buffer_indices = list(track_positions)
     idx = (
         torch.tensor(
             track_positions,
             dtype=torch.int64,
-            pin_memory=True,
+            pin_memory=is_pin_memory_available(all_buffers.device),
         )
         .unsqueeze(1)
         .to(device=all_buffers.device, non_blocking=True)
     )
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    track_indices = torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    return list(track_positions), track_indices
+
+
+def set_mamba_track_indices_from_reqs(
+    batch, track_positions: Optional[List[int]] = None
+):
+    """Build mamba_track_indices from req objects (authoritative source)."""
+    batch.mamba_track_buffer_indices, batch.mamba_track_indices = (
+        mamba_track_indices_from_reqs(
+            req_to_token_pool=batch.req_to_token_pool,
+            req_pool_indices=batch.req_pool_indices,
+            reqs=batch.reqs,
+            track_positions=track_positions,
+        )
     )
 
 
@@ -2935,7 +2966,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             merged_seq_lens_cpu = None
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
+        # === 上流 #39342 / PR #39526 (2026-09-19 取り込み) ===
+        # merge_batch は mamba_track_* を無条件に捨て、GDN バックエンドは
+        # `if forward_batch.mamba_track_mask is not None:` でガードしているので、
+        # 素のままだと MIXED forward で extend 行のチェックポイントが書かれない。
+        # ところが prepare_for_extend は既に mamba_last_track_seqlen を進めており、
+        # 誰も戻さない。結果、木は「書かれていないスロット」をその長さのものとして
+        # 寄贈し、同じ prefix を共有する以降のリクエストが壊れた SSM 状態を復元する
+        # (上流 #39342: 不一致 10.7% 対 1.4%)。
+        # lazy モードでは ping-pong のフリップは起きないが
+        # mamba_last_track_seqlen は進むので**同じように壊れる**。
+        #
+        # 最初は「簿記を巻き戻す」案(上流案b)で入れたが、上流 #39526 は
+        # **tracking を merge の向こうへ持ち越す**案(a)を採っており、
+        # そちらは**チェックポイントを取り逃さない**ぶん優れている。
+        # decode 行は mask=False で足す(この forward では checkpoint を取らない)。
+        # seqlen は -1 だが mask=False なので extend 側の索引計算には入らない。
+        # スロットIDだけは**実在の値**を入れる(索引変換と graph の track buffer が
+        # 全行を読むので -1 は無害ではない)。
+        mamba_track = self._mamba_track_for_mixed(running_batch)
+
         self.merge_batch(running_batch)
+        if mamba_track is not None:
+            (
+                self.mamba_track_indices,
+                self.mamba_track_mask,
+                self.mamba_track_seqlens,
+            ) = mamba_track
         self.out_cache_loc = out_cache_loc
         if merged_seq_lens_cpu is not None:
             self.seq_lens_cpu = merged_seq_lens_cpu
@@ -3023,6 +3080,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         shortfalls retract gracefully instead of tripping fail-loud alloc
         errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        # PR #32129 retarget: the PR replaced num_tokens outright before the
+        # old `available_size() >= num_tokens` gate. 0.5.19 moved the gate into
+        # the allocator, so the mixed-KV worst case is folded into the number
+        # handed to it instead. `max` rather than `=`: the normal estimate is
+        # still a floor, and both terms shrink as retract drops requests, so
+        # the retract loop keeps converging.
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        mixed_kv_enabled = getattr(kvcache, "mixed_kv_enabled", None)
+        if (
+            self.spec_algorithm.is_none()
+            and mixed_kv_enabled is not None
+            and mixed_kv_enabled()
+        ):
+            # Worst-case: every req flushes this step -> bs*N_Q quant slots.
+            num_reqs = (
+                len(self.reqs) if selected_indices is None else len(selected_indices)
+            )
+            num_tokens = max(num_tokens, num_reqs * int(kvcache.flush_interval))
         return self.token_to_kv_pool_allocator.check_decode_capacity(
             num_tokens=num_tokens, tree_cache=self.tree_cache
         )
@@ -3459,6 +3534,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 new_indices_cpu=keep_indices,
             )
+
+    def _mamba_track_for_mixed(self, running_batch: ScheduleBatch):
+        """Extend-row checkpoint tracking that survives `merge_batch`.
+
+        上流 PR #39526 (#39342 の修正)。呼び出し元のコメントに理由あり。
+        """
+        if self.mamba_track_mask is None:
+            return None
+        running_bs = running_batch.batch_size()
+        device = self.mamba_track_mask.device
+        running_track_indices = running_batch.mamba_track_indices
+        if running_track_indices is None:
+            # Spec decode prepares its track indices inside the forward.
+            _, running_track_indices = mamba_track_indices_from_reqs(
+                req_to_token_pool=self.req_to_token_pool,
+                req_pool_indices=running_batch.req_pool_indices,
+                reqs=running_batch.reqs,
+            )
+        # prepare_for_extend already claimed the tracked extend rows' slots and
+        # stamped their donate depth, so this forward must still write them.
+        # The decode tails take no checkpoint here: masked off with the -1
+        # seqlen of an untracked extend row, but with a real slot id because
+        # index translation and the graph track buffers read every row.
+        return (
+            torch.cat([self.mamba_track_indices, running_track_indices]),
+            torch.cat(
+                [
+                    self.mamba_track_mask,
+                    torch.zeros(running_bs, dtype=torch.bool, device=device),
+                ]
+            ),
+            torch.cat(
+                [
+                    self.mamba_track_seqlens,
+                    torch.full((running_bs,), -1, dtype=torch.int64, device=device),
+                ]
+            ),
+        )
 
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
