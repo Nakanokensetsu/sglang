@@ -97,7 +97,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
             pool_label=pool_label,
         )
-        self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
+        self.element_dim = self._compute_element_dim()
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only
         # helpers in hicache.cuh are guarded by USE_ROCM and the staged
         # write-back kernel has a ROCm path, so enable them on HIP too. This
@@ -149,6 +149,21 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
         self._init_write_back_staging_buffers()
+
+    def _compute_element_dim(self) -> int:
+        """1トークン・1層・K(または V)あたりの要素数。
+
+        ホスト本体バッファの1トークン幅(``token_stride_size``)および
+        デバイス側の1行のバイト数と**必ず一致**しなければならない。転送カーネルは
+        この値を ``element_dim`` / ``element_size`` として受け取り、src/dst の
+        両方へ同じ幅を適用する(``kv_cache_src_stride_bytes`` にホスト側の
+        ``token_stride_size`` を渡しているのがその証拠)。
+
+        2026-09-20 自前追加: デバイスの ``head_dim`` がそのままバイト数に
+        ならない量子化プール(int2)のためにサブクラスが差し替えられるよう
+        メソッドへ切り出した。
+        """
+        return self.device_pool.head_num * self.device_pool.head_dim
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -1018,6 +1033,345 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
+class Int2MHATokenToKVPoolHost(MHATokenToKVPoolHost):
+    """Host KV pool for the OSCAR INT2 device pool (2026-09-20 自前追加).
+
+    素の ``MHATokenToKVPoolHost`` は1トークンを
+    ``head_num * head_dim * dtype.itemsize`` バイトの連続領域として扱う。
+    INT2 プールはそれが2点で成り立たない:
+
+    1. packed codes は ``[slots, head_num, head_dim // 4]`` uint8。
+       1ヘッドあたり ``head_dim`` ではなく ``head_dim // 4`` バイトしかない。
+    2. 量子化の scale/zero は ``k_scales_zeros`` という**別テンソル**
+       (``[slots, head_num, 2 * num_groups]``, ``scale_dtype``)。これを運ばないと
+       ホストから戻したスロットは**前の占有者の scale/zero で解釈され、静かに壊れる**。
+
+    【2026-09-20 修正】最初の実装は「1トークン = packed + sz の連続領域」とみなして
+    ``head_dim`` を実効バイト数(packed + sz)へ差し替えていた。これが誤りだった:
+    sz は結局**別バッファ**に置いたので、ホスト本体バッファだけが幅広になり、
+    転送カーネルはデバイス側の1行(= packed のみ)を超えて読み書きしていた。
+    さらに親の ``element_dim`` は**デバイスの** ``head_dim`` から算出されるため、
+    そこだけ4倍幅のまま残っていた。**転送に関わる3つの幅が三者三様**という状態で、
+    症状は毎回「最初の長文リクエストで CUDA illegal memory access」になる。
+
+    現在の取り決め:
+      * ホスト本体バッファは **packed codes だけ**を持つ。1ヘッド ``head_dim // 4``
+        バイト。これでホストの ``token_stride_size`` とデバイスの行バイト数が一致する。
+      * scales/zeros は ``host_k_sz`` / ``host_v_sz`` に別建てで持ち、packed と
+        同じ ``host_indices`` / ``device_indices`` で別途運ぶ。
+      * ``get_size_per_token`` が返すのは **packed + sz を足した**バイト数。
+        ホストRAM から取れるスロット数 ``self.size`` はこれで決まるので、
+        sz を数えないと確保量を過小申告することになる。
+      * 3つの幅は ``_assert_transfer_geometry`` が**起動時に**突き合わせる。
+        食い違ったまま起動させない。
+    """
+
+    def __init__(self, device_pool, *args, **kwargs):
+        assert getattr(device_pool, "dtype", None) == "int2", (
+            "Int2MHATokenToKVPoolHost requires an int2 device pool, got "
+            f"{getattr(device_pool, 'dtype', None)!r}"
+        )
+        # packed: head_dim//4 バイト/ヘッド (uint8)
+        self._packed_bytes_per_head_k = device_pool.head_dim // 4
+        self._packed_bytes_per_head_v = device_pool.v_head_dim // 4
+        # scales/zeros: 2 * num_groups 要素/ヘッド
+        sz_itemsize = torch.empty(0, dtype=device_pool.scale_dtype).element_size()
+        self._sz_bytes_per_head_k = 2 * device_pool.k_num_scale_groups * sz_itemsize
+        self._sz_bytes_per_head_v = 2 * device_pool.v_num_scale_groups * sz_itemsize
+        if (
+            self._packed_bytes_per_head_k != self._packed_bytes_per_head_v
+            or self._sz_bytes_per_head_k != self._sz_bytes_per_head_v
+        ):
+            # 親は K と V を同じ dims の1本の ``kv_buffer`` に確保する。非対称は
+            # ``AsymmetricMHATokenToKVPoolHost`` 相当の作り直しが要る。
+            raise NotImplementedError(
+                "Int2 HiCache host pool requires symmetric K/V geometry: "
+                f"k packed={self._packed_bytes_per_head_k}B "
+                f"sz={self._sz_bytes_per_head_k}B vs "
+                f"v packed={self._packed_bytes_per_head_v}B "
+                f"sz={self._sz_bytes_per_head_v}B."
+            )
+        super().__init__(device_pool, *args, **kwargs)
+        self._assert_transfer_geometry()
+
+    def _compute_element_dim(self) -> int:
+        # 親はデバイスの head_dim(例: 256)から算出するが、int2 のデバイス行は
+        # head_dim//4 バイトしかない。ホスト本体バッファの幅に合わせる。
+        return self.head_num * self._packed_bytes_per_head_k
+
+    def get_size_per_token(self):
+        self.head_num = self.device_pool.head_num
+        # ホスト本体バッファは packed codes のみ。dtype は uint8(itemsize=1)なので、
+        # head_dim にバイト数をそのまま入れれば親の init_kv_buffer /
+        # token_stride_size がデバイス側と同じ幅を導く。
+        self.head_dim = self._packed_bytes_per_head_k
+        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+        # 容量計算(self.size の決定)には sz ぶんも含める。ホストRAMは両方食う。
+        k_bytes = self.head_num * (
+            self._packed_bytes_per_head_k + self._sz_bytes_per_head_k
+        )
+        v_bytes = self.head_num * (
+            self._packed_bytes_per_head_v + self._sz_bytes_per_head_v
+        )
+        return (k_bytes + v_bytes) * self.layer_num
+
+    def get_ksize_per_token(self):
+        k_bytes = self.head_num * (
+            self._packed_bytes_per_head_k + self._sz_bytes_per_head_k
+        )
+        return k_bytes * self.layer_num
+
+    def init_kv_buffer(self):
+        """packed 用の本体バッファ。``head_dim`` は packed バイト数に置き換え済みなので、
+        親の実装がそのまま正しいサイズを確保する。
+        scales/zeros は ``_init_int2_sz_buffer`` が別に確保する。"""
+        buf = super().init_kv_buffer()
+        self._init_int2_sz_buffer()
+        return buf
+
+    def _init_int2_sz_buffer(self):
+        """scales/zeros 用のホストバッファ(K/V 各層)。
+
+        packed と同じ ``self.size`` スロットを持ち、1スロットあたり
+        ``head_num * 2 * num_groups`` 要素 (``scale_dtype``)。
+        packed と同じインデックス空間を使うので、転送は同じ host_indices で済む。
+        """
+        dp = self.device_pool
+        alloc_func = ALLOC_MEMORY_FUNCS[dp.device]
+        self.sz_dtype = dp.scale_dtype
+        k_dims = (self.layer_num, self.size, self.head_num, 2 * dp.k_num_scale_groups)
+        v_dims = (self.layer_num, self.size, self.head_num, 2 * dp.v_num_scale_groups)
+        self.host_k_sz = alloc_func(
+            k_dims,
+            dtype=self.sz_dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+            registration_granularity_bytes=None,
+        )
+        self.host_v_sz = alloc_func(
+            v_dims,
+            dtype=self.sz_dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+            registration_granularity_bytes=None,
+        )
+
+    def _assert_transfer_geometry(self):
+        """転送に関わる幅を起動時に突き合わせる。
+
+        ここが食い違うと症状は必ず「最初の長文リクエストで CUDA illegal memory
+        access」になり、原因の切り分けに非常に時間がかかる(2026-09-20 に3回踏んだ)。
+        起動時1回きりなので常に実行する。
+        """
+        dp = self.device_pool
+
+        # MTP draft プールは packed を packed_device_*_ptrs 経由でまとめて運ぶが、
+        # sz 側にその配線が無い。黙って sz を落とすと静かに壊れるので拒否する。
+        if self.mtp_draft_device_pools:
+            raise NotImplementedError(
+                "int2 HiCache does not support MTP draft KV pools yet: the "
+                "scales/zeros transfer has no packed-draft path."
+            )
+
+        def _row_bytes(t: torch.Tensor) -> int:
+            # 1スロット(= 1トークン)ぶんのバイト数。
+            return t[0].numel() * t.element_size()
+
+        dev_k_row = _row_bytes(dp.k_buffer[0])
+        dev_v_row = _row_bytes(dp.v_buffer[0])
+        host_row = self.token_stride_size
+        element_bytes = self.element_dim * self.dtype.itemsize
+
+        detail = (
+            f"host token_stride={host_row}B, element_dim*itemsize={element_bytes}B, "
+            f"device k row={dev_k_row}B, device v row={dev_v_row}B "
+            f"(head_num={self.head_num}, device head_dim={dp.head_dim}, "
+            f"packed/head={self._packed_bytes_per_head_k}B, "
+            f"sz/head={self._sz_bytes_per_head_k}B)"
+        )
+        assert dev_k_row == dev_v_row, f"int2 device K/V rows differ: {detail}"
+        assert host_row == dev_k_row, (
+            "int2 HiCache host token stride does not match the device row; "
+            f"transfers would run past the device buffer. {detail}"
+        )
+        assert element_bytes == dev_k_row, (
+            "int2 HiCache element_dim does not match the device row; "
+            f"the JIT kernel would copy the wrong width. {detail}"
+        )
+        assert self.dtype == dp.store_dtype, (
+            f"int2 HiCache host dtype {self.dtype} != device store_dtype "
+            f"{dp.store_dtype}"
+        )
+
+        # scales/zeros 側。ホストとデバイスで1スロットの要素数・dtype が一致すること。
+        host_k_sz_row = self.host_k_sz[0][0].numel()
+        dev_k_sz_row = dp.k_scales_zeros[0][0].numel()
+        host_v_sz_row = self.host_v_sz[0][0].numel()
+        dev_v_sz_row = dp.v_scales_zeros[0][0].numel()
+        assert host_k_sz_row == dev_k_sz_row and host_v_sz_row == dev_v_sz_row, (
+            "int2 HiCache scales/zeros row mismatch: host "
+            f"k={host_k_sz_row}/v={host_v_sz_row} elems, device "
+            f"k={dev_k_sz_row}/v={dev_v_sz_row} elems"
+        )
+        assert (
+            self.host_k_sz.dtype == dp.k_scales_zeros[0].dtype
+            and self.host_v_sz.dtype == dp.v_scales_zeros[0].dtype
+        ), (
+            f"int2 HiCache scales/zeros dtype mismatch: host {self.host_k_sz.dtype}, "
+            f"device {dp.k_scales_zeros[0].dtype}"
+        )
+
+        # 層数。sz バッファは host 側の layer_num 本、device は自分の layer_num 本。
+        assert self.host_k_sz.shape[0] == self.layer_num
+        assert len(dp.k_scales_zeros) == len(dp.k_buffer)
+
+        # ホスト側スロット数。packed と sz が同じインデックス空間を使う前提。
+        assert self.host_k_sz.shape[1] == self.size, (
+            f"int2 HiCache sz host slots {self.host_k_sz.shape[1]} != "
+            f"packed slots {self.size}"
+        )
+
+        logger.info(
+            "Int2 HiCache host pool geometry verified: %d B/token/layer packed "
+            "(K+V), %d B/token/layer scales+zeros (K+V), %d layers, %d slots.",
+            2 * host_row,
+            2 * self.head_num * self._sz_bytes_per_head_k,
+            self.layer_num,
+            self.size,
+        )
+
+    def _transfer_int2_scales_zeros(
+        self, host_indices, device_indices, layer_pairs, to_host: bool
+    ):
+        """scales/zeros を層ごとに運ぶ。
+
+        packed 側は親の K/V 経路がそのまま運ぶので、ここは scales/zeros だけを担当する。
+        JIT カーネルは ``element_size % 128 == 0`` を要求する
+        (``can_use_hicache_jit_kernel``)が、scales/zeros は1行が数十バイトしかなく
+        不適格なので torch のインデックス代入で運ぶ。量は packed の 1/2 以下で
+        転送1回につき1度なので、ここがボトルネックにはならない。
+
+        ``layer_pairs`` は ``(host_layer_id, device_layer_id)`` の列。CP 層分割や
+        MTP draft では両者がずれるため、呼び出し側が親と同じ対応で渡す。
+        呼び出しは ``L2TransferEngine`` の転送ストリーム内で行われるので、ここで
+        発行する torch の演算も同じストリームに乗る。
+        """
+        dp = self.device_pool
+        h_idx = host_indices.to(device="cpu", dtype=torch.int64)
+        d_idx = device_indices.to(device=dp.k_buffer[0].device, dtype=torch.int64)
+        # インデックス範囲の検査。ここが原因なら illegal access ではなく
+        # この assert で止まるので、packed 側の非同期エラーと区別できる。
+        if h_idx.numel():
+            h_max = int(h_idx.max())
+            h_min = int(h_idx.min())
+            assert 0 <= h_min and h_max < self.host_k_sz.shape[1], (
+                f"int2 HiCache host index out of range: [{h_min}, {h_max}] "
+                f"vs host slots {self.host_k_sz.shape[1]}"
+            )
+        if d_idx.numel():
+            dev_slots = dp.k_scales_zeros[0].shape[0]
+            d_max = int(d_idx.max())
+            d_min = int(d_idx.min())
+            assert 0 <= d_min and d_max < dev_slots, (
+                f"int2 HiCache device index out of range: [{d_min}, {d_max}] "
+                f"vs device slots {dev_slots}"
+            )
+        for host_layer_id, device_layer_id in layer_pairs:
+            for host_buf, dev_bufs in (
+                (self.host_k_sz, dp.k_scales_zeros),
+                (self.host_v_sz, dp.v_scales_zeros),
+            ):
+                h = host_buf[host_layer_id]
+                d = dev_bufs[device_layer_id]
+                if to_host:
+                    # D2H。CPU 側への散布は値が届いてからでないとできないので、
+                    # ここは同期コピーになる(転送ストリーム上の1回だけ)。
+                    h[h_idx] = d[d_idx].to("cpu")
+                else:
+                    d[d_idx] = h[h_idx].to(d.device)
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        super().backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        # 親の all-layer 経路はデバイスの全所有層を運ぶ。sz も同じ対応で運ぶ。
+        if self.device_pool is not None:
+            device_layer_ids = self._owned_device_layer_ids(device_pool)
+            layer_pairs = [
+                (self._host_layer_index(lid, device_pool), lid)
+                for lid in device_layer_ids
+            ]
+        else:
+            layer_pairs = [(lid, lid) for lid in range(self.layer_num)]
+        self._transfer_int2_scales_zeros(
+            host_indices, device_indices, layer_pairs, to_host=True
+        )
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ):
+        super().load_to_device_per_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
+        # 親と同じ層対応。所有していない層は親が早期 return するのでここも合わせる。
+        if self.device_pool is not None:
+            if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
+                return
+            host_layer_id = (
+                layer_id if is_draft else self._host_layer_index(layer_id, device_pool)
+            )
+            device_layer_id = 0 if is_draft else layer_id
+        else:
+            host_layer_id = device_layer_id = layer_id
+        self._transfer_int2_scales_zeros(
+            host_indices, device_indices, ((host_layer_id, device_layer_id),),
+            to_host=False,
+        )
+
+    # --- L3 (ストレージ backend) 経路は未対応 ---------------------------------
+    # 親の flat data page は本体バッファ(= packed codes)だけを平坦化する。int2 は
+    # scales/zeros が別バッファなので、そのまま書き出すと復元側で前の占有者の
+    # scale/zero を使うことになり、静かに壊れる。L2(ホストRAM)だけを使う分には
+    # これらは呼ばれない(呼ぶのは storage backend のみ)。
+
+    def _l3_unsupported(self) -> NotImplementedError:
+        return NotImplementedError(
+            "int2 HiCache does not support L3 storage backends yet: the flat "
+            "data page carries only the packed codes, not the scales/zeros."
+        )
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise self._l3_unsupported()
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise self._l3_unsupported()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise self._l3_unsupported()
+
+    def get_page_buffer_meta(self, indices):
+        raise self._l3_unsupported()
+
+    def get_split_heads_page_buffer_meta(self, *args, **kwargs):
+        raise self._l3_unsupported()
+
+
 class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     """Host KV pool for MHA models whose K and V have different head dims
     (``head_dim != v_head_dim``), e.g. MiMo-V2.
@@ -1407,6 +1761,11 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    # 2026-09-20 自前追加: INT2 は 1トークンが packed codes と scales/zeros の
+    # 2テンソルに分かれ、packed は head_dim ではなく head_dim//4 バイトしかない。
+    # 素の MHATokenToKVPoolHost は 4倍のバイト数を読んで範囲外アクセスで落ちる。
+    if getattr(device_pool, "dtype", None) == "int2":
+        return Int2MHATokenToKVPoolHost
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost
