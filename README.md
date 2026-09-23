@@ -6,7 +6,7 @@
 > | | |
 > |---|---|
 > | Model | [Qwen3.8-27B-Escha-W2](https://huggingface.co/centraly/Qwen3.8-27B-Escha-W2) - 2-bit dense, hybrid GDN + full attention |
-> | Runtime | stock [**v0.5.19**](https://github.com/sgl-project/sglang/releases/tag/v0.5.19) + this branch ([`escha-0519-base`](../../tree/escha-0519-base) is the untouched tag) |
+> | Runtime | stock [**v0.5.19**](https://github.com/sgl-project/sglang/releases/tag/v0.5.19) + this branch ([`escha-0519-base`](https://github.com/Nakanokensetsu/sglang/tree/escha-0519-base) is the untouched tag) |
 > | KV cache | OSCAR INT2 ([PR #32129](https://github.com/sgl-project/sglang/pull/32129)) + **HiCache L2 in host RAM** |
 > | VRAM | 10.1 GB idle / 11.1 GB at full prefill, of 12.0 GB per card |
 > | Context | 131,072 - KV pool **210,000 tokens** - concurrency 10 |
@@ -23,7 +23,7 @@
 > `--hicache-ratio 2` pins 10.3 GB of host RAM and makes a 32 GB machine swap.
 >
 > The 0.5.15 MoE setup this fork started from is on
-> [`escha-oscar-int2`](../../tree/escha-oscar-int2).
+> [`escha-oscar-int2`](https://github.com/Nakanokensetsu/sglang/tree/escha-oscar-int2).
 >
 > Everything below is the upstream SGLang README.
 
