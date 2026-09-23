@@ -1327,7 +1327,7 @@ class Scheduler(
         # chunked_prefill_size を変えても N は据え置きで済む。
         # 既定は並列設定 (max_running_requests) にそのまま紐付ける。並列数を
         # 変えれば取り分も自動で追従するので、設定が二重に増えない。
-        _n = os.environ.get("SGLANG_PREFILL_CONCURRENCY", "").strip()
+        _n = envs.SGLANG_PREFILL_CONCURRENCY.get()
         # 既定は並列セッション制限数そのもの。2026-09-23: 以前は x2 にしていたが、
         # 1本あたりの取り分が常に小さすぎて予算が余っていた(実測: 8本同時でも
         # 8x409=3272 / 8192 = 40%しか使わない)。パスは大きいほど効率が良く
@@ -1336,15 +1336,13 @@ class Scheduler(
         # getattr: このメソッドを Scheduler の組み立て途中(モック含む)から呼ぶ経路では
         # max_running_requests がまだ無い。その場合は N 逆算を諦めて CLI 値に従う。
         _limit = getattr(self, "max_running_requests", None)
-        if not _n.isdigit() and _limit:
-            _n = str(max(1, int(_limit)))
+        if _n is None and _limit:
+            _n = max(1, int(_limit))
         # さらに細かく刻みたいときの分割係数 K。F = 予算 / (N * K)。
         # 小さいほど短文の待ちは縮むが、パス数が増えて長文の prefill が落ちる
         # (実測: F=1024 で 1,216 tok/s、F=512 で 1,098 tok/s = -14%)。
-        _k = os.environ.get("SGLANG_PREFILL_SPLIT_FACTOR", "").strip()
-        _k = int(_k) if _k.isdigit() and int(_k) >= 1 else 1
-        if _n.isdigit() and int(_n) >= 1 and self.chunked_prefill_size:
-            _n = int(_n)
+        _k = max(1, envs.SGLANG_PREFILL_SPLIT_FACTOR.get() or 1)
+        if _n is not None and _n >= 1 and self.chunked_prefill_size:
             _derived = max(1, self.chunked_prefill_size // (_n * _k))
             get_context().override(
                 "prefill_concurrency", long_prefill_token_threshold=_derived
@@ -3848,9 +3846,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # 2026-09-22 自前追加: 容量で弾かれた要求の後ろを何本まで見るか。
-        _overtake_budget = (
-            16 if os.environ.get("SGLANG_ADMIT_OVERTAKE", "") == "1" else 0
-        )
+        _overtake_budget = 16 if envs.SGLANG_ADMIT_OVERTAKE.get() else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3918,10 +3914,7 @@ class Scheduler(
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
-            if (
-                res != AddReqResult.CONTINUE
-                and os.environ.get("SGLANG_DEBUG_ADMIT", "") == "1"
-            ):
+            if res != AddReqResult.CONTINUE and envs.SGLANG_DEBUG_ADMIT.get():
                 # 受理されなかった理由と予算の内訳を出す診断ログ(既定OFF)。
                 # 「容量で弾かれた要求の後ろが検査されない」の特定に使った。
                 _need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

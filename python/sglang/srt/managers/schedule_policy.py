@@ -788,7 +788,7 @@ class PrefillAdder:
         F = self.long_prefill_token_threshold
         if F <= 0:
             return 0
-        _ALWAYS = os.environ.get("SGLANG_LONG_PREFILL_CEILING_ALWAYS", "") == "1"
+        _ALWAYS = envs.SGLANG_LONG_PREFILL_CEILING_ALWAYS.get()
         contended = self.waiting_queue_len > 0 or self.num_carried_chunked_reqs > 1
         if not contended:
             # 2026-09-22: 非競合でも上限で刻む。単独巡航中に予算8192を丸ごと使うと、
@@ -807,8 +807,7 @@ class PrefillAdder:
             # 2026-09-22: 本数でちょうど割ると1本あたりが大きすぎ、後から来た要求が
             # 進行中パスの残りを長く待つ。セッション数に倍率をかけて更に細かく刻む
             # (既定2 = セッション数の倍で割る)。SGLANG_PREFILL_SPLIT_FACTOR で変更可。
-            _k = os.environ.get("SGLANG_PREFILL_SPLIT_FACTOR", "").strip()
-            _k = int(_k) if _k.isdigit() and int(_k) >= 1 else 1
+            _k = max(1, envs.SGLANG_PREFILL_SPLIT_FACTOR.get() or 1)
             share = max(self.page_size, self.chunk_budget_total // (n_active * _k))
             return min(F, share)
         return F

@@ -577,6 +577,23 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Concurrent chunked prefill (escha). N sessions share one pass budget:
+    # F = chunked_prefill_size / (N * K) caps what any one request takes.
+    # N defaults to max_running_requests; set this to pin it instead.
+    SGLANG_PREFILL_CONCURRENCY = EnvInt(None)
+    # Extra divisor on top of N. Smaller slices cut a newcomer's wait but add
+    # passes: F=1024 gives 1,216 tok/s, F=512 gives 1,098 (-14%).
+    SGLANG_PREFILL_SPLIT_FACTOR = EnvInt(1)
+    # Apply the per-request ceiling even when nothing is waiting. Off, a lone
+    # long prefill takes the whole budget and a request arriving mid-pass waits
+    # it out (measured 3.99s at F=2048; 0.56s with this on at F=409).
+    SGLANG_LONG_PREFILL_CEILING_ALWAYS = EnvBool(False)
+    # Keep scanning the waiting queue past a request rejected for capacity.
+    # Off (FCFS), a 30-token request queued behind a 71K-token one is never
+    # examined — measured 109s with 68,540 tokens free in the pool.
+    SGLANG_ADMIT_OVERTAKE = EnvBool(False)
+    # Log why each request was refused admission, with the budget breakdown.
+    SGLANG_DEBUG_ADMIT = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

@@ -1,9 +1,10 @@
-import os
 import unittest
+from functools import wraps
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -40,7 +41,13 @@ class _RecordingDelayer:
 # 下の7件は「1本あたりの上限 F が必ず効く」前提で書かれている。実運用の既定は
 # 「譲る相手がいるときだけ効く」+「予算を本数で均等割り」なので、上限の機構そのもの
 # を検証したいテストはこのフラグで無条件適用に固定する。
-_ceiling_always = patch.dict(os.environ, {"SGLANG_LONG_PREFILL_CEILING_ALWAYS": "1"})
+def _ceiling_always(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        with envs.SGLANG_LONG_PREFILL_CEILING_ALWAYS.override(True):
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class TestPrefillAdder(CustomTestCase):

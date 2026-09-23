@@ -45,9 +45,12 @@ logger = logging.getLogger(__name__)
 
 # the reference codec (MIT) fused code decode+GEMM kernel. Imported lazily-safe so the
 # module loads even where the reference codec is absent (apply() then falls back / errors).
+# NOTE: the import that would bind `_ref_ext` has never been present in this
+# fork, so the NameError below is caught every time and HAS_REF is always False
+# — the reference kernel is not used (startup logs `ref_gemm: NO`). Kept as-is
+# rather than "fixed": wiring the import would silently switch the GEMM path.
 try:
-
-    HAS_REF = hasattr(_ref_ext, "ref_gemm")
+    HAS_REF = hasattr(_ref_ext, "ref_gemm")  # noqa: F821
 except Exception:  # pragma: no cover
     _ref_ext = None
     HAS_REF = False
