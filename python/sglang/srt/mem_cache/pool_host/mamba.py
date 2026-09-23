@@ -462,16 +462,26 @@ class MambaPoolHost(HostKVCache):
         if True:
             logger.info(
                 "mamba transfer host buffer: shape=%s pinned=%s registered=%s",
-                tuple(dst.shape), dst.is_pinned(),
+                tuple(dst.shape),
+                dst.is_pinned(),
                 hasattr(dst, "_sglang_cuda_host_registered_ranges"),
             )
             logger.info(
                 "mamba transfer geometry: num_layers=%d item_size=%dB "
                 "device[shape=%s slots=%d] host[shape=%s slots=%d stride0=%dB] "
                 "src_idx=[%d,%d] dst_idx=[%d,%d] n=%d",
-                num_layers, item_size, tuple(src0.shape), dev_slots,
-                tuple(dst.shape), host_slots, dst_slot_stride,
-                s_min, s_max, d_min, d_max, src_indices.numel(),
+                num_layers,
+                item_size,
+                tuple(src0.shape),
+                dev_slots,
+                tuple(dst.shape),
+                host_slots,
+                dst_slot_stride,
+                s_min,
+                s_max,
+                d_min,
+                d_max,
+                src_indices.numel(),
             )
 
     @staticmethod
@@ -504,8 +514,13 @@ class MambaPoolHost(HostKVCache):
             #   (b) index が範囲外
             # の2つ。発射前に両方を突き合わせる。
             MambaPoolHost._debug_verify_lf_pf(
-                src_layers, dst, src_indices, dst_indices, num_layers,
-                src_ptrs, item_size,
+                src_layers,
+                dst,
+                src_indices,
+                dst_indices,
+                num_layers,
+                src_ptrs,
+                item_size,
             )
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,

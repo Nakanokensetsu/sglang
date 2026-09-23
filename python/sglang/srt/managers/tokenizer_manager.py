@@ -1255,7 +1255,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # 2026-09-19: thinking_budget の配線(上流 #25536)。
             self._autowire_thinking_budget(obj)
 
-
     def _autowire_thinking_budget(self, obj) -> None:
         """custom_params.thinking_budget があるのに custom_logit_processor が
         未指定のリクエストへ、このモデル用の思考予算プロセッサを割り当てる。

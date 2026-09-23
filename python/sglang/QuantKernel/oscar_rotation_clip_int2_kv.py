@@ -19,7 +19,7 @@ constexprs (``-1`` disables clip).
 from __future__ import annotations
 
 import warnings
-from typing import Dict, Tuple
+from typing import Tuple
 
 import torch
 import triton

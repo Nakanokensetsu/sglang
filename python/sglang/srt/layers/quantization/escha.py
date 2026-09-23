@@ -30,7 +30,7 @@ Serving requirements:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -555,7 +555,7 @@ class DIEschaConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "DIEschaConfig":
+    def from_config(cls, config: Dict[str, Any]) -> DIEschaConfig:
         global_cfg = config.get("global_config", {})
         codebook = global_cfg.get("codebook", config.get("codebook", "cbA"))
         bits = global_cfg.get("bits", config.get("bits", 2.0))

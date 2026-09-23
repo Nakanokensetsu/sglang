@@ -88,8 +88,12 @@ def _groupwise_dequantize_int2_torch(
     q3 = ((packed >> 6) & 0x03).to(torch.float32)
     g0 = torch.arange(quarter_dim, device=packed.device) // group_size
     g1 = (torch.arange(quarter_dim, device=packed.device) + quarter_dim) // group_size
-    g2 = (torch.arange(quarter_dim, device=packed.device) + 2 * quarter_dim) // group_size
-    g3 = (torch.arange(quarter_dim, device=packed.device) + 3 * quarter_dim) // group_size
+    g2 = (
+        torch.arange(quarter_dim, device=packed.device) + 2 * quarter_dim
+    ) // group_size
+    g3 = (
+        torch.arange(quarter_dim, device=packed.device) + 3 * quarter_dim
+    ) // group_size
     out = torch.empty(
         (packed.shape[0], packed.shape[1], head_dim),
         dtype=torch.float32,
@@ -182,19 +186,27 @@ def _quantized_set_kv_int2_kernel(
 
     vals0 = tl.load(
         input_ptr + input_offset_base + dim_offsets * input_stride_dim,
-        mask=dim_mask, other=0.0,
+        mask=dim_mask,
+        other=0.0,
     ).to(tl.float32)
     vals1 = tl.load(
         input_ptr + input_offset_base + (dim_offsets + quarter_dim) * input_stride_dim,
-        mask=dim_mask, other=0.0,
+        mask=dim_mask,
+        other=0.0,
     ).to(tl.float32)
     vals2 = tl.load(
-        input_ptr + input_offset_base + (dim_offsets + 2 * quarter_dim) * input_stride_dim,
-        mask=dim_mask, other=0.0,
+        input_ptr
+        + input_offset_base
+        + (dim_offsets + 2 * quarter_dim) * input_stride_dim,
+        mask=dim_mask,
+        other=0.0,
     ).to(tl.float32)
     vals3 = tl.load(
-        input_ptr + input_offset_base + (dim_offsets + 3 * quarter_dim) * input_stride_dim,
-        mask=dim_mask, other=0.0,
+        input_ptr
+        + input_offset_base
+        + (dim_offsets + 3 * quarter_dim) * input_stride_dim,
+        mask=dim_mask,
+        other=0.0,
     ).to(tl.float32)
 
     val_min = tl.minimum(
@@ -272,9 +284,9 @@ def _quantized_set_kv_int2_grouped_kernel(
 
     input_base = token_idx * input_stride_token + head_idx * input_stride_head
 
-    vals0 = tl.load(
-        input_ptr + input_base + dim_offsets_2d * input_stride_dim
-    ).to(tl.float32)
+    vals0 = tl.load(input_ptr + input_base + dim_offsets_2d * input_stride_dim).to(
+        tl.float32
+    )
     vals1 = tl.load(
         input_ptr + input_base + (dim_offsets_2d + quarter_dim) * input_stride_dim
     ).to(tl.float32)
@@ -285,14 +297,22 @@ def _quantized_set_kv_int2_grouped_kernel(
         input_ptr + input_base + (dim_offsets_2d + 3 * quarter_dim) * input_stride_dim
     ).to(tl.float32)
 
-    min0 = tl.min(vals0, axis=1); max0 = tl.max(vals0, axis=1)
-    min1 = tl.min(vals1, axis=1); max1 = tl.max(vals1, axis=1)
-    min2 = tl.min(vals2, axis=1); max2 = tl.max(vals2, axis=1)
-    min3 = tl.min(vals3, axis=1); max3 = tl.max(vals3, axis=1)
-    s0 = tl.maximum(max0 - min0, 1e-8) / 3.0; z0 = tl.math.div_rn(-min0, s0)
-    s1 = tl.maximum(max1 - min1, 1e-8) / 3.0; z1 = tl.math.div_rn(-min1, s1)
-    s2 = tl.maximum(max2 - min2, 1e-8) / 3.0; z2 = tl.math.div_rn(-min2, s2)
-    s3 = tl.maximum(max3 - min3, 1e-8) / 3.0; z3 = tl.math.div_rn(-min3, s3)
+    min0 = tl.min(vals0, axis=1)
+    max0 = tl.max(vals0, axis=1)
+    min1 = tl.min(vals1, axis=1)
+    max1 = tl.max(vals1, axis=1)
+    min2 = tl.min(vals2, axis=1)
+    max2 = tl.max(vals2, axis=1)
+    min3 = tl.min(vals3, axis=1)
+    max3 = tl.max(vals3, axis=1)
+    s0 = tl.maximum(max0 - min0, 1e-8) / 3.0
+    z0 = tl.math.div_rn(-min0, s0)
+    s1 = tl.maximum(max1 - min1, 1e-8) / 3.0
+    z1 = tl.math.div_rn(-min1, s1)
+    s2 = tl.maximum(max2 - min2, 1e-8) / 3.0
+    z2 = tl.math.div_rn(-min2, s2)
+    s3 = tl.maximum(max3 - min3, 1e-8) / 3.0
+    z3 = tl.math.div_rn(-min3, s3)
 
     q0 = (tl.math.div_rn(vals0, s0[:, None]) + z0[:, None] + 0.5).to(tl.uint8)
     q1 = (tl.math.div_rn(vals1, s1[:, None]) + z1[:, None] + 0.5).to(tl.uint8)
@@ -333,7 +353,9 @@ def _launch_quantize_int2(
     num_tokens, num_heads, head_dim = cache.shape
     if num_tokens == 0:
         return
-    assert head_dim % 4 == 0, f"head_dim must be divisible by 4 for INT2, got {head_dim}"
+    assert (
+        head_dim % 4 == 0
+    ), f"head_dim must be divisible by 4 for INT2, got {head_dim}"
     num_groups = _get_num_scale_groups(scales_zeros_buffer)
     grid = (num_tokens, num_heads)
     if num_groups == 1:
@@ -411,11 +433,21 @@ def quantized_set_kv_int2_triton(
 
 @triton.jit
 def _dequantize_kv_int2_kernel(
-    quantized_ptr, scales_zeros_ptr, output_ptr,
-    cache_size, num_heads, head_dim,
-    quant_stride_cache, quant_stride_head, quant_stride_dim,
-    sz_stride_cache, sz_stride_head, sz_stride_dim,
-    out_stride_cache, out_stride_head, out_stride_dim,
+    quantized_ptr,
+    scales_zeros_ptr,
+    output_ptr,
+    cache_size,
+    num_heads,
+    head_dim,
+    quant_stride_cache,
+    quant_stride_head,
+    quant_stride_dim,
+    sz_stride_cache,
+    sz_stride_head,
+    sz_stride_dim,
+    out_stride_cache,
+    out_stride_head,
+    out_stride_dim,
     BLOCK_SIZE_DIM: tl.constexpr,
 ):
     cache_idx = tl.program_id(0)
@@ -432,7 +464,8 @@ def _dequantize_kv_int2_kernel(
     dim_mask = dim_offsets < quarter_dim
 
     quant_offset = (
-        cache_idx * quant_stride_cache + head_idx * quant_stride_head
+        cache_idx * quant_stride_cache
+        + head_idx * quant_stride_head
         + dim_offsets * quant_stride_dim
     )
     packed = tl.load(quantized_ptr + quant_offset, mask=dim_mask, other=0)
@@ -444,9 +477,21 @@ def _dequantize_kv_int2_kernel(
 
     out_base = cache_idx * out_stride_cache + head_idx * out_stride_head
     tl.store(output_ptr + out_base + dim_offsets * out_stride_dim, d0, mask=dim_mask)
-    tl.store(output_ptr + out_base + (dim_offsets + quarter_dim) * out_stride_dim, d1, mask=dim_mask)
-    tl.store(output_ptr + out_base + (dim_offsets + 2 * quarter_dim) * out_stride_dim, d2, mask=dim_mask)
-    tl.store(output_ptr + out_base + (dim_offsets + 3 * quarter_dim) * out_stride_dim, d3, mask=dim_mask)
+    tl.store(
+        output_ptr + out_base + (dim_offsets + quarter_dim) * out_stride_dim,
+        d1,
+        mask=dim_mask,
+    )
+    tl.store(
+        output_ptr + out_base + (dim_offsets + 2 * quarter_dim) * out_stride_dim,
+        d2,
+        mask=dim_mask,
+    )
+    tl.store(
+        output_ptr + out_base + (dim_offsets + 3 * quarter_dim) * out_stride_dim,
+        d3,
+        mask=dim_mask,
+    )
 
 
 @triton.jit
@@ -503,13 +548,21 @@ def _dequantize_kv_int2_grouped_kernel(
     g2 = g_ids + 2 * NUM_GROUPS_QUARTER
     g3 = g_ids + 3 * NUM_GROUPS_QUARTER
     s0 = tl.load(scales_zeros_ptr + sz_base + (g0 * 2) * sz_stride_dim).to(tl.float32)
-    z0 = tl.load(scales_zeros_ptr + sz_base + (g0 * 2 + 1) * sz_stride_dim).to(tl.float32)
+    z0 = tl.load(scales_zeros_ptr + sz_base + (g0 * 2 + 1) * sz_stride_dim).to(
+        tl.float32
+    )
     s1 = tl.load(scales_zeros_ptr + sz_base + (g1 * 2) * sz_stride_dim).to(tl.float32)
-    z1 = tl.load(scales_zeros_ptr + sz_base + (g1 * 2 + 1) * sz_stride_dim).to(tl.float32)
+    z1 = tl.load(scales_zeros_ptr + sz_base + (g1 * 2 + 1) * sz_stride_dim).to(
+        tl.float32
+    )
     s2 = tl.load(scales_zeros_ptr + sz_base + (g2 * 2) * sz_stride_dim).to(tl.float32)
-    z2 = tl.load(scales_zeros_ptr + sz_base + (g2 * 2 + 1) * sz_stride_dim).to(tl.float32)
+    z2 = tl.load(scales_zeros_ptr + sz_base + (g2 * 2 + 1) * sz_stride_dim).to(
+        tl.float32
+    )
     s3 = tl.load(scales_zeros_ptr + sz_base + (g3 * 2) * sz_stride_dim).to(tl.float32)
-    z3 = tl.load(scales_zeros_ptr + sz_base + (g3 * 2 + 1) * sz_stride_dim).to(tl.float32)
+    z3 = tl.load(scales_zeros_ptr + sz_base + (g3 * 2 + 1) * sz_stride_dim).to(
+        tl.float32
+    )
 
     d0 = (q0 - z0[:, None]) * s0[:, None]
     d1 = (q1 - z1[:, None]) * s1[:, None]
@@ -532,8 +585,10 @@ def _dequantize_kv_int2_grouped_kernel(
 
 
 def dequantize_kv_int2_triton(
-    quantized: torch.Tensor, scales_zeros: torch.Tensor,
-    head_dim: int, model_dtype: torch.dtype,
+    quantized: torch.Tensor,
+    scales_zeros: torch.Tensor,
+    head_dim: int,
+    model_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dequantize INT2 KV cache to ``model_dtype``.
@@ -547,12 +602,16 @@ def dequantize_kv_int2_triton(
     cache_size, num_heads, _ = quantized.shape
     if out is None:
         output = torch.empty(
-            (cache_size, num_heads, head_dim), dtype=model_dtype, device=quantized.device
+            (cache_size, num_heads, head_dim),
+            dtype=model_dtype,
+            device=quantized.device,
         )
     else:
-        assert tuple(out.shape) == (cache_size, num_heads, head_dim), (
-            f"out shape {tuple(out.shape)} != {(cache_size, num_heads, head_dim)}"
-        )
+        assert tuple(out.shape) == (
+            cache_size,
+            num_heads,
+            head_dim,
+        ), f"out shape {tuple(out.shape)} != {(cache_size, num_heads, head_dim)}"
         assert out.dtype == model_dtype and out.device == quantized.device
         output = out
     grid = (cache_size, num_heads)
@@ -561,11 +620,21 @@ def dequantize_kv_int2_triton(
     if num_groups == 1:
         BLOCK_SIZE_DIM = triton.next_power_of_2(head_dim // 4)
         _dequantize_kv_int2_kernel[grid](
-            quantized, scales_zeros, output,
-            cache_size, num_heads, head_dim,
-            quantized.stride(0), quantized.stride(1), quantized.stride(2),
-            scales_zeros.stride(0), scales_zeros.stride(1), scales_zeros.stride(2),
-            output.stride(0), output.stride(1), output.stride(2),
+            quantized,
+            scales_zeros,
+            output,
+            cache_size,
+            num_heads,
+            head_dim,
+            quantized.stride(0),
+            quantized.stride(1),
+            quantized.stride(2),
+            scales_zeros.stride(0),
+            scales_zeros.stride(1),
+            scales_zeros.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
             BLOCK_SIZE_DIM=BLOCK_SIZE_DIM,
         )
         return output

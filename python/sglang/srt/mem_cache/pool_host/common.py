@@ -304,7 +304,11 @@ def _alloc_cuda_host(
 ) -> torch.Tensor:
     if _host_register_is_mappable():
         return alloc_with_host_register(
-            dims, dtype, device, pin_memory, allocator,
+            dims,
+            dtype,
+            device,
+            pin_memory,
+            allocator,
             registration_granularity_bytes,
         )
     # cudaHostAlloc 経路。``allocator``(mmap/shm)は使えないので、

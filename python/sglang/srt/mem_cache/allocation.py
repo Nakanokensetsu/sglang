@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_kv_pool import (
-    UnifiedInt2HPKVPool,
     resolve_mixed_kv_pool,
 )
 from sglang.srt.runtime_context import attention_backends, get_parallel

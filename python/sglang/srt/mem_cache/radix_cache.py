@@ -48,7 +48,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.unified_kv_pool import (
-    UnifiedInt2HPKVPool,
     resolve_mixed_kv_pool_from_allocator,
 )
 from sglang.srt.mem_cache.utils import (

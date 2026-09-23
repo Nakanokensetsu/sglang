@@ -1340,7 +1340,9 @@ class Int2MHATokenToKVPoolHost(MHATokenToKVPoolHost):
         else:
             host_layer_id = device_layer_id = layer_id
         self._transfer_int2_scales_zeros(
-            host_indices, device_indices, ((host_layer_id, device_layer_id),),
+            host_indices,
+            device_indices,
+            ((host_layer_id, device_layer_id),),
             to_host=False,
         )
 

@@ -292,7 +292,6 @@ from sglang.srt.mem_cache.common import (
     retraction_discard,
 )
 from sglang.srt.mem_cache.unified_kv_pool import (
-    UnifiedInt2HPKVPool,
     resolve_mixed_kv_pool,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors

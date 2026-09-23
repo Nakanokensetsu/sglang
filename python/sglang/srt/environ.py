@@ -1699,7 +1699,6 @@ class Envs:
     SGLANG_HADAMARD_ORDER = EnvInt(16)
 
 
-
 envs = Envs()
 EnvField._allow_set_name = False
 

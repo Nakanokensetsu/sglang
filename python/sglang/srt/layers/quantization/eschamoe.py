@@ -101,7 +101,7 @@ class DIEschaMoEConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "DIEschaMoEConfig":
+    def from_config(cls, config: Dict[str, Any]) -> DIEschaMoEConfig:
         g = config.get("global_config", {})
         return cls(
             codebook=g.get("codebook", "cbA"),
