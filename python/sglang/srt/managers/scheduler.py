@@ -1305,6 +1305,7 @@ class Scheduler(
         )
         if is_extend:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
+
     def init_chunked_prefill_concurrency(self):
         """Raise the mid-prefill capacity when the per-request ceiling is on.
 
@@ -3923,9 +3924,7 @@ class Scheduler(
             ):
                 # 受理されなかった理由と予算の内訳を出す診断ログ(既定OFF)。
                 # 「容量で弾かれた要求の後ろが検査されない」の特定に使った。
-                _need = len(req.full_untruncated_fill_ids) - len(
-                    req.prefix_indices
-                )
+                _need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
                 _allocatable = self.get_num_allocatable_reqs(
                     len(running_batch.reqs), running_batch=running_batch
                 )
