@@ -23,13 +23,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.quantized_kv_prefill import (
-    _apply_oscar_rotation,
-    _pool_uses_oscar_rotation,
-    apply_inverse_v_rotation,
-    dequantize_prefix_kv,
-    prepare_quantized_extend_qkv,
-)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
@@ -38,10 +31,9 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_kv_pool import (
-    UnifiedInt2HPKVPool,
     resolve_mixed_kv_pool,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -235,6 +227,7 @@ def _scatter_mixed_kv_indices_kernel(
         hp_running += tl.sum(hp_inc, axis=0)
         quant_running += tl.sum(quant_inc, axis=0)
 
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -303,11 +296,10 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
-        from sglang.kernels.ops.attention.decode_attention import (
+        from sglang.kernels.ops.attention.decode_attention import (  # 2026-09-18 自前移植: OSCAR int2 のデコード経路
             _LEAN_BLOCK_M,
             _lean_decode_launch_params,
             decode_attention_fwd,
-            # 2026-09-18 自前移植: OSCAR int2 のデコード経路
             decode_attention_fwd_int2_unified,
             decode_attention_fwd_quantized,
             lean_capture_policy,
@@ -2227,9 +2219,7 @@ class TritonAttnBackend(AttentionBackend):
             torch.tensor(list(prefix_lens_cpu), dtype=torch.int32, device=self.device),
             dim=0,
         )
-        kv_indices = torch.arange(
-            total_prefix, dtype=torch.int32, device=self.device
-        )
+        kv_indices = torch.arange(total_prefix, dtype=torch.int32, device=self.device)
         qo_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
         qo_indptr[1:] = torch.cumsum(
             torch.tensor(list(extend_lens_cpu), dtype=torch.int32, device=self.device),
@@ -2255,9 +2245,7 @@ class TritonAttnBackend(AttentionBackend):
             1.0,
             1.0,
             sm_scale=layer.scaling,
-            logit_cap=logit_capping_mod(
-                layer.logit_capping_method, layer.logit_cap
-            ),
+            logit_cap=logit_capping_mod(layer.logit_capping_method, layer.logit_cap),
         )
 
         out = apply_inverse_v_rotation(out, kv_pool, layer, need_v_inverse)
@@ -2539,9 +2527,7 @@ class TritonAttnBackend(AttentionBackend):
             q_for_decode = _apply_oscar_rotation(q_for_decode, R_k, kv_group_num)
 
             # --- PR #32129 移植 2026-09-19: mixed HP+int2 の単発 unified デコード ---
-            mixed_metadata_ready = (
-                self.forward_metadata.mixed_hp_kv_indptr is not None
-            )
+            mixed_metadata_ready = self.forward_metadata.mixed_hp_kv_indptr is not None
             if self.enable_mixed_kv:
                 # ここで metadata が無いまま非mixed 経路へ落ちると、HP スロットID
                 # (>= hp_global_offset) を quant スロットIDとして読み、量子化

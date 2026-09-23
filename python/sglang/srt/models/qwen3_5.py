@@ -1808,8 +1808,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
         # モデル dtype(fp16)へ揃える。
         weights = [
-            (_n, _w.to(torch.float16)
-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            (
+                _n,
+                (
+                    _w.to(torch.float16)
+                    if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16)
+                    else _w
+                ),
+            )
             for _n, _w in weights
         ]
         # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
@@ -1822,10 +1828,19 @@ class Qwen3_5ForCausalLM(nn.Module):
             for _n, _w in weights:
                 if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
                     _b = _n.rsplit(".", 1)[0]
-                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    _ibuf.setdefault(_b, {})[
+                        "i" if _n.endswith(".weight_int8") else "s"
+                    ] = _w
                     if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
-                        _iout.append((_b + ".weight",
-                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        _iout.append(
+                            (
+                                _b + ".weight",
+                                (
+                                    _ibuf[_b]["i"].float()
+                                    * _ibuf[_b]["s"].unsqueeze(1).float()
+                                ).half(),
+                            )
+                        )
                         del _ibuf[_b]
                 else:
                     _iout.append((_n, _w))
@@ -1925,8 +1940,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
         # モデル dtype(fp16)へ揃える。
         weights = [
-            (_n, _w.to(torch.float16)
-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            (
+                _n,
+                (
+                    _w.to(torch.float16)
+                    if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16)
+                    else _w
+                ),
+            )
             for _n, _w in weights
         ]
         # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
@@ -1939,10 +1960,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             for _n, _w in weights:
                 if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
                     _b = _n.rsplit(".", 1)[0]
-                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    _ibuf.setdefault(_b, {})[
+                        "i" if _n.endswith(".weight_int8") else "s"
+                    ] = _w
                     if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
-                        _iout.append((_b + ".weight",
-                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        _iout.append(
+                            (
+                                _b + ".weight",
+                                (
+                                    _ibuf[_b]["i"].float()
+                                    * _ibuf[_b]["s"].unsqueeze(1).float()
+                                ).half(),
+                            )
+                        )
                         del _ibuf[_b]
                 else:
                     _iout.append((_n, _w))
@@ -2219,8 +2249,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
         # モデル dtype(fp16)へ揃える。
         weights = [
-            (_n, _w.to(torch.float16)
-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            (
+                _n,
+                (
+                    _w.to(torch.float16)
+                    if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16)
+                    else _w
+                ),
+            )
             for _n, _w in weights
         ]
         # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
@@ -2233,10 +2269,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             for _n, _w in weights:
                 if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
                     _b = _n.rsplit(".", 1)[0]
-                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    _ibuf.setdefault(_b, {})[
+                        "i" if _n.endswith(".weight_int8") else "s"
+                    ] = _w
                     if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
-                        _iout.append((_b + ".weight",
-                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        _iout.append(
+                            (
+                                _b + ".weight",
+                                (
+                                    _ibuf[_b]["i"].float()
+                                    * _ibuf[_b]["s"].unsqueeze(1).float()
+                                ).half(),
+                            )
+                        )
                         del _ibuf[_b]
                 else:
                     _iout.append((_n, _w))
@@ -2417,8 +2462,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # 混在すると CompilationError("Mismatched type ... bf16 ... fp16") になる。
         # モデル dtype(fp16)へ揃える。
         weights = [
-            (_n, _w.to(torch.float16)
-             if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16) else _w)
+            (
+                _n,
+                (
+                    _w.to(torch.float16)
+                    if (hasattr(_w, "dtype") and _w.dtype == torch.bfloat16)
+                    else _w
+                ),
+            )
             for _n, _w in weights
         ]
         # 2026-09-18 自前移植(escha 1.2.2 の qwen3_5.py 由来):
@@ -2431,10 +2482,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             for _n, _w in weights:
                 if _n.endswith(".weight_int8") or _n.endswith(".weight_scale"):
                     _b = _n.rsplit(".", 1)[0]
-                    _ibuf.setdefault(_b, {})["i" if _n.endswith(".weight_int8") else "s"] = _w
+                    _ibuf.setdefault(_b, {})[
+                        "i" if _n.endswith(".weight_int8") else "s"
+                    ] = _w
                     if "i" in _ibuf[_b] and "s" in _ibuf[_b]:
-                        _iout.append((_b + ".weight",
-                                      (_ibuf[_b]["i"].float() * _ibuf[_b]["s"].unsqueeze(1).float()).half()))
+                        _iout.append(
+                            (
+                                _b + ".weight",
+                                (
+                                    _ibuf[_b]["i"].float()
+                                    * _ibuf[_b]["s"].unsqueeze(1).float()
+                                ).half(),
+                            )
+                        )
                         del _ibuf[_b]
                 else:
                     _iout.append((_n, _w))

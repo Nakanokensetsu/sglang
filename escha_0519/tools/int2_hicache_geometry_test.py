@@ -8,6 +8,7 @@
 
   PYTHONPATH=/path/to/sglang/python python3 tools/int2_hicache_geometry_test.py
 """
+
 import sys
 
 import torch
@@ -65,8 +66,15 @@ class FakeInt2Pool:
 #   --kv-cache-quant-group-size 64 -> groups = 256/64 = 4
 #   SGLANG_MIXED_KV_SCALE_DTYPE 未設定 -> float32
 # => packed 64B/head, sz 32B/head。K は 1トークン packed 128B + sz 64B。
-def build(layer_num=4, size=1024, head_num=2, head_dim=256, groups=4,
-          scale_dtype=torch.float32, layout="layer_first"):
+def build(
+    layer_num=4,
+    size=1024,
+    head_num=2,
+    head_dim=256,
+    groups=4,
+    scale_dtype=torch.float32,
+    layout="layer_first",
+):
     seen = {}
 
     def fake_jit_probe(*, element_size, **kw):
@@ -104,27 +112,34 @@ def main():
     print(f"host token_stride_size    : {host.token_stride_size} B")
     print(f"element_dim * itemsize    : {host.element_dim * host.dtype.itemsize} B")
     probe = seen.get("element_size")
-    print(f"JIT probe asked for       : {probe} B"
-          + ("  (非CUDA環境なので未呼び出し)" if probe is None else ""))
+    print(
+        f"JIT probe asked for       : {probe} B"
+        + ("  (非CUDA環境なので未呼び出し)" if probe is None else "")
+    )
     print(f"size_per_token (packed+sz): {host.size_per_token} B")
     print(f"host slots                : {host.size}")
-    print(f"host sz buffer            : {tuple(host.host_k_sz.shape)} {host.host_k_sz.dtype}")
+    print(
+        f"host sz buffer            : {tuple(host.host_k_sz.shape)} {host.host_k_sz.dtype}"
+    )
 
     assert host.token_stride_size == dev_row
     assert host.element_dim * host.dtype.itemsize == dev_row
     # _is_cuda が False の環境では親が JIT 判定自体を行わない。呼ばれた時だけ検査する。
     if probe is not None:
         assert probe == dev_row, seen
-        assert probe % 128 == 0, (
-            f"element_size {probe} は JIT カーネルの 128B 境界を満たさない"
-        )
+        assert (
+            probe % 128 == 0
+        ), f"element_size {probe} は JIT カーネルの 128B 境界を満たさない"
     # packed + sz の合計で容量を数えていること(packed だけなら過小申告になる)
     packed = 2 * host.head_num * (head_bytes := dp.head_dim // 4) * dp.layer_num
     sz_itemsize = torch.empty(0, dtype=dp.scale_dtype).element_size()
     sz = 2 * host.head_num * 2 * dp.k_num_scale_groups * sz_itemsize * dp.layer_num
     assert host.size_per_token == packed + sz, (host.size_per_token, packed, sz)
     # 実バッファのバイト数がデバイス1層ぶんの packed と整合すること
-    assert host.kv_buffer.numel() == 2 * host.layer_num * host.size * host.head_num * head_bytes
+    assert (
+        host.kv_buffer.numel()
+        == 2 * host.layer_num * host.size * host.head_num * head_bytes
+    )
 
     check_sz_roundtrip(dp, host)
     check_guard_fires()
@@ -146,18 +161,18 @@ def check_sz_roundtrip(dp, host):
     device_indices = torch.tensor([3, 17, 4, 1000], dtype=torch.int64)
     host_indices = torch.tensor([11, 0, 900, 5], dtype=torch.int64)
 
-    expect_k = [dp.k_scales_zeros[l][device_indices].clone()
-                for l in range(dp.layer_num)]
-    expect_v = [dp.v_scales_zeros[l][device_indices].clone()
-                for l in range(dp.layer_num)]
+    expect_k = [
+        dp.k_scales_zeros[l][device_indices].clone() for l in range(dp.layer_num)
+    ]
+    expect_v = [
+        dp.v_scales_zeros[l][device_indices].clone() for l in range(dp.layer_num)
+    ]
 
     # packed 側は CUDA カーネルなので CPU では呼べない。親の実装だけ黙らせて
     # Int2 側の追加分(sz)だけを通す。
     orig_backup = mha.MHATokenToKVPoolHost.backup_from_device_all_layer
     orig_load = mha.MHATokenToKVPoolHost.load_to_device_per_layer
-    mha.MHATokenToKVPoolHost.backup_from_device_all_layer = (
-        lambda self, *a, **kw: None
-    )
+    mha.MHATokenToKVPoolHost.backup_from_device_all_layer = lambda self, *a, **kw: None
     mha.MHATokenToKVPoolHost.load_to_device_per_layer = lambda self, *a, **kw: None
     try:
         host.backup_from_device_all_layer(dp, host_indices, device_indices, "kernel")
@@ -177,8 +192,10 @@ def check_sz_roundtrip(dp, host):
     # 触っていないスロットが巻き込まれていないこと
     untouched = torch.tensor([2, 50], dtype=torch.int64)
     assert dp.k_scales_zeros[0][untouched].abs().sum() == 0
-    print("scales/zeros roundtrip    : 一致 "
-          f"({dp.layer_num} 層 x {len(device_indices)} スロット)")
+    print(
+        "scales/zeros roundtrip    : 一致 "
+        f"({dp.layer_num} 層 x {len(device_indices)} スロット)"
+    )
 
 
 def check_guard_fires():

@@ -2132,8 +2132,6 @@ def _get_shared_kv_scale_group_size(
     return k_group_size if (k_grouped or v_grouped) else max(k_group_size, v_group_size)
 
 
-
-
 # ── OSCAR int2 quantized KV decode (ported for Escha-W2, see
 # escha-w2-production-handover-2026-09-11 memory) ─────────────────────────
 def decode_attention_fwd_quantized(
@@ -2184,7 +2182,7 @@ def decode_attention_fwd_quantized(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
-            )
+        )
     else:
         decode_attention_fwd_grouped_quant_int2(
             q,
@@ -2203,7 +2201,7 @@ def decode_attention_fwd_quantized(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
-            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2337,9 +2335,7 @@ def _fwd_kernel_stage1_quant_int2(
                 safe_group_k_q1 = tl.where(mask_d_packed, offs_group_k_q1, 0)
                 safe_group_k_q2 = tl.where(mask_d_packed, offs_group_k_q2, 0)
                 safe_group_k_q3 = tl.where(mask_d_packed, offs_group_k_q3, 0)
-                offs_sz_k = (
-                    kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_sz_kh
-                )
+                offs_sz_k = kv_loc[:, None] * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 k_scale_q0 = tl.load(
                     K_Scales_Zeros + offs_sz_k + 2 * safe_group_k_q0[None, :],
                     mask=(offs_n[:, None] < split_kv_end) & (mask_d_packed[None, :]),
@@ -2382,8 +2378,7 @@ def _fwd_kernel_stage1_quant_int2(
                 )
                 # Dequantize INT2 K inline: unpack 4 crumbs and dequantize per-group.
                 k_q0 = (
-                    ((k_quant_packed & 0x03).to(tl.float32) - k_zero_q0)
-                    * k_scale_q0
+                    ((k_quant_packed & 0x03).to(tl.float32) - k_zero_q0) * k_scale_q0
                 ).to(q_q0.dtype)
                 k_q1 = (
                     (((k_quant_packed >> 2) & 0x03).to(tl.float32) - k_zero_q1)
@@ -2468,9 +2463,7 @@ def _fwd_kernel_stage1_quant_int2(
                 safe_group_v_q1 = tl.where(mask_dv_packed, offs_group_v_q1, 0)
                 safe_group_v_q2 = tl.where(mask_dv_packed, offs_group_v_q2, 0)
                 safe_group_v_q3 = tl.where(mask_dv_packed, offs_group_v_q3, 0)
-                offs_sz_v = (
-                    kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
-                )
+                offs_sz_v = kv_loc[:, None] * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 v_scale_q0 = tl.load(
                     V_Scales_Zeros + offs_sz_v + 2 * safe_group_v_q0[None, :],
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv_packed[None, :]),
@@ -2513,8 +2506,7 @@ def _fwd_kernel_stage1_quant_int2(
                 )
                 # Dequantize INT2 V inline: unpack 4 crumbs per-group.
                 v_q0 = (
-                    ((v_quant_packed & 0x03).to(tl.float32) - v_zero_q0)
-                    * v_scale_q0
+                    ((v_quant_packed & 0x03).to(tl.float32) - v_zero_q0) * v_scale_q0
                 ).to(q_q0.dtype)
                 v_q1 = (
                     (((v_quant_packed >> 2) & 0x03).to(tl.float32) - v_zero_q1)
@@ -2829,75 +2821,99 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     )
                     k_scale_q0_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q0_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     k_scale_q1_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q1[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q1_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q1[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     k_scale_q2_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q2[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q2_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q2[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     k_scale_q3_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q3[:, None],
-                        mask=offs_n[None, :] < split_kv_end, other=1.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=1.0,
                     )
                     k_zero_q3_grp = tl.load(
                         K_Scales_Zeros + offs_sz_k + 2 * offs_grp_k_q3[:, None] + 1,
-                        mask=offs_n[None, :] < split_kv_end, other=0.0,
+                        mask=offs_n[None, :] < split_kv_end,
+                        other=0.0,
                     )
                     # Broadcast per-group across GROUP_SIZE dims via reshape.
                     k_scale_q0 = tl.reshape(
-                        tl.broadcast_to(k_scale_q0_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q0_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q0 = tl.reshape(
-                        tl.broadcast_to(k_zero_q0_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q0_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_scale_q1 = tl.reshape(
-                        tl.broadcast_to(k_scale_q1_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q1_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q1 = tl.reshape(
-                        tl.broadcast_to(k_zero_q1_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q1_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_scale_q2 = tl.reshape(
-                        tl.broadcast_to(k_scale_q2_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q2_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q2 = tl.reshape(
-                        tl.broadcast_to(k_zero_q2_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q2_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_scale_q3 = tl.reshape(
-                        tl.broadcast_to(k_scale_q3_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_scale_q3_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                     k_zero_q3 = tl.reshape(
-                        tl.broadcast_to(k_zero_q3_grp[:, None, :],
-                                        (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N)),
+                        tl.broadcast_to(
+                            k_zero_q3_grp[:, None, :],
+                            (NUM_GROUPS_QUARTER, GROUP_SIZE, BLOCK_N),
+                        ),
                         (BLOCK_D // 4, BLOCK_N),
                     )
                 else:
@@ -2905,46 +2921,92 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     # entirely within a single group, so just load 1 (scale,
                     # zero) per (quarter, token) and broadcast across all dims.
                     offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
-                    k_scale_q0_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q0_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q1_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q1_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q2_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q2_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q3_t = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    k_zero_q3_t  = tl.load(K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    k_scale_q0 = tl.broadcast_to(k_scale_q0_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q0  = tl.broadcast_to(k_zero_q0_t[None, :],  (BLOCK_D // 4, BLOCK_N))
-                    k_scale_q1 = tl.broadcast_to(k_scale_q1_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q1  = tl.broadcast_to(k_zero_q1_t[None, :],  (BLOCK_D // 4, BLOCK_N))
-                    k_scale_q2 = tl.broadcast_to(k_scale_q2_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q2  = tl.broadcast_to(k_zero_q2_t[None, :],  (BLOCK_D // 4, BLOCK_N))
-                    k_scale_q3 = tl.broadcast_to(k_scale_q3_t[None, :], (BLOCK_D // 4, BLOCK_N))
-                    k_zero_q3  = tl.broadcast_to(k_zero_q3_t[None, :],  (BLOCK_D // 4, BLOCK_N))
+                    k_scale_q0_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q0_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q0 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q1_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q1_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q1 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q2_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q2_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q2 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q3_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    k_zero_q3_t = tl.load(
+                        K_Scales_Zeros + offs_sz_k_1d + 2 * grp_q3 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    k_scale_q0 = tl.broadcast_to(
+                        k_scale_q0_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q0 = tl.broadcast_to(
+                        k_zero_q0_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_scale_q1 = tl.broadcast_to(
+                        k_scale_q1_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q1 = tl.broadcast_to(
+                        k_zero_q1_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_scale_q2 = tl.broadcast_to(
+                        k_scale_q2_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q2 = tl.broadcast_to(
+                        k_zero_q2_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_scale_q3 = tl.broadcast_to(
+                        k_scale_q3_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
+                    k_zero_q3 = tl.broadcast_to(
+                        k_zero_q3_t[None, :], (BLOCK_D // 4, BLOCK_N)
+                    )
                 # Cast scales/zeros to q's dtype ONCE so the per-element dequant
                 # below stays entirely in bf16 (saves 2 fp32↔bf16 casts per crumb).
                 k_scale_q0 = k_scale_q0.to(q_q0.dtype)
-                k_zero_q0  = k_zero_q0.to(q_q0.dtype)
+                k_zero_q0 = k_zero_q0.to(q_q0.dtype)
                 k_scale_q1 = k_scale_q1.to(q_q0.dtype)
-                k_zero_q1  = k_zero_q1.to(q_q0.dtype)
+                k_zero_q1 = k_zero_q1.to(q_q0.dtype)
                 k_scale_q2 = k_scale_q2.to(q_q0.dtype)
-                k_zero_q2  = k_zero_q2.to(q_q0.dtype)
+                k_zero_q2 = k_zero_q2.to(q_q0.dtype)
                 k_scale_q3 = k_scale_q3.to(q_q0.dtype)
-                k_zero_q3  = k_zero_q3.to(q_q0.dtype)
+                k_zero_q3 = k_zero_q3.to(q_q0.dtype)
                 # Dequantize INT2 K inline: unpack 4 crumbs per-group.
                 # k_packed shape: [BLOCK_D//4, BLOCK_N] (transposed)
                 k_q0 = ((k_packed & 0x03).to(q_q0.dtype) - k_zero_q0) * k_scale_q0
-                k_q1 = (((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_q1) * k_scale_q1
-                k_q2 = (((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_q2) * k_scale_q2
-                k_q3 = (((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_q3) * k_scale_q3
+                k_q1 = (
+                    ((k_packed >> 2) & 0x03).to(q_q0.dtype) - k_zero_q1
+                ) * k_scale_q1
+                k_q2 = (
+                    ((k_packed >> 4) & 0x03).to(q_q0.dtype) - k_zero_q2
+                ) * k_scale_q2
+                k_q3 = (
+                    ((k_packed >> 6) & 0x03).to(q_q0.dtype) - k_zero_q3
+                ) * k_scale_q3
             else:
                 offs_sz_k_1d = kv_loc * stride_sz_kbs + cur_kv_head * stride_sz_kh
                 k_scale_1d = tl.load(
@@ -2979,18 +3041,18 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             # We use tl.join (which adds a new last axis) + tl.reshape to
             # interleave: [BLOCK_D//4, BLOCK_N] -> [4, BLOCK_D//4, BLOCK_N]
             # via two binary joins -> permute -> reshape to [BLOCK_D, BLOCK_N].
-            k_01 = tl.join(k_q0, k_q1)        # [BLOCK_D//4, BLOCK_N, 2]
-            k_23 = tl.join(k_q2, k_q3)        # [BLOCK_D//4, BLOCK_N, 2]
-            k_full = tl.join(k_01, k_23)      # [BLOCK_D//4, BLOCK_N, 2, 2]
+            k_01 = tl.join(k_q0, k_q1)  # [BLOCK_D//4, BLOCK_N, 2]
+            k_23 = tl.join(k_q2, k_q3)  # [BLOCK_D//4, BLOCK_N, 2]
+            k_full = tl.join(k_01, k_23)  # [BLOCK_D//4, BLOCK_N, 2, 2]
             k_full = tl.reshape(k_full, (BLOCK_D // 4, BLOCK_N, 4))
-            k_full = tl.permute(k_full, (2, 0, 1))      # [4, BLOCK_D//4, BLOCK_N]
+            k_full = tl.permute(k_full, (2, 0, 1))  # [4, BLOCK_D//4, BLOCK_N]
             k_full = tl.reshape(k_full, (BLOCK_D, BLOCK_N))
 
-            q_01 = tl.join(q_q0, q_q1)        # [BLOCK_H, BLOCK_D//4, 2]
+            q_01 = tl.join(q_q0, q_q1)  # [BLOCK_H, BLOCK_D//4, 2]
             q_23 = tl.join(q_q2, q_q3)
-            q_full = tl.join(q_01, q_23)      # [BLOCK_H, BLOCK_D//4, 2, 2]
+            q_full = tl.join(q_01, q_23)  # [BLOCK_H, BLOCK_D//4, 2, 2]
             q_full = tl.reshape(q_full, (BLOCK_H, BLOCK_D // 4, 4))
-            q_full = tl.permute(q_full, (0, 2, 1))      # [BLOCK_H, 4, BLOCK_D//4]
+            q_full = tl.permute(q_full, (0, 2, 1))  # [BLOCK_H, 4, BLOCK_D//4]
             q_full = tl.reshape(q_full, (BLOCK_H, BLOCK_D))
 
             qk = tl.dot(q_full, k_full)
@@ -3016,7 +3078,8 @@ def _fwd_grouped_kernel_stage1_quant_int2(
             )
             v_packed = tl.load(
                 V_Buffer + offs_buf_v_packed,
-                mask=(offs_n[:, None] < split_kv_end) & (offs_d_packed_v[None, :] < (L // 4)),
+                mask=(offs_n[:, None] < split_kv_end)
+                & (offs_d_packed_v[None, :] < (L // 4)),
                 other=0,
             )
 
@@ -3032,118 +3095,188 @@ def _fwd_grouped_kernel_stage1_quant_int2(
                     )
                     v_scale_q0_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q0_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q1_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q1[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q1_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q1[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q2_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q2[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q2_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q2[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q3_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q3[None, :],
-                        mask=offs_n[:, None] < split_kv_end, other=1.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=1.0,
                     )
                     v_zero_q3_grp = tl.load(
                         V_Scales_Zeros + offs_sz_v + 2 * offs_grp_v_q3[None, :] + 1,
-                        mask=offs_n[:, None] < split_kv_end, other=0.0,
+                        mask=offs_n[:, None] < split_kv_end,
+                        other=0.0,
                     )
                     v_scale_q0 = tl.reshape(
-                        tl.broadcast_to(v_scale_q0_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q0_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q0 = tl.reshape(
-                        tl.broadcast_to(v_zero_q0_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q0_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q1 = tl.reshape(
-                        tl.broadcast_to(v_scale_q1_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q1_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q1 = tl.reshape(
-                        tl.broadcast_to(v_zero_q1_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q1_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q2 = tl.reshape(
-                        tl.broadcast_to(v_scale_q2_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q2_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q2 = tl.reshape(
-                        tl.broadcast_to(v_zero_q2_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q2_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_scale_q3 = tl.reshape(
-                        tl.broadcast_to(v_scale_q3_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_scale_q3_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                     v_zero_q3 = tl.reshape(
-                        tl.broadcast_to(v_zero_q3_grp[:, :, None],
-                                        (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE)),
+                        tl.broadcast_to(
+                            v_zero_q3_grp[:, :, None],
+                            (BLOCK_N, NUM_GROUPS_QUARTER, GROUP_SIZE),
+                        ),
                         (BLOCK_N, BLOCK_D // 4),
                     )
                 else:
                     # Fallback: group spans multiple quarters.
                     offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
-                    v_scale_q0_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q0_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q1_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q1_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q2_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q2_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q3_t = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3,
-                                           mask=offs_n < split_kv_end, other=1.0)
-                    v_zero_q3_t  = tl.load(V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3 + 1,
-                                           mask=offs_n < split_kv_end, other=0.0)
-                    v_scale_q0 = tl.broadcast_to(v_scale_q0_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q0  = tl.broadcast_to(v_zero_q0_t[:, None],  (BLOCK_N, BLOCK_D // 4))
-                    v_scale_q1 = tl.broadcast_to(v_scale_q1_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q1  = tl.broadcast_to(v_zero_q1_t[:, None],  (BLOCK_N, BLOCK_D // 4))
-                    v_scale_q2 = tl.broadcast_to(v_scale_q2_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q2  = tl.broadcast_to(v_zero_q2_t[:, None],  (BLOCK_N, BLOCK_D // 4))
-                    v_scale_q3 = tl.broadcast_to(v_scale_q3_t[:, None], (BLOCK_N, BLOCK_D // 4))
-                    v_zero_q3  = tl.broadcast_to(v_zero_q3_t[:, None],  (BLOCK_N, BLOCK_D // 4))
+                    v_scale_q0_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q0_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q0 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q1_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q1_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q1 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q2_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q2_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q2 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q3_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3,
+                        mask=offs_n < split_kv_end,
+                        other=1.0,
+                    )
+                    v_zero_q3_t = tl.load(
+                        V_Scales_Zeros + offs_sz_v_1d + 2 * v_grp_q3 + 1,
+                        mask=offs_n < split_kv_end,
+                        other=0.0,
+                    )
+                    v_scale_q0 = tl.broadcast_to(
+                        v_scale_q0_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q0 = tl.broadcast_to(
+                        v_zero_q0_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_scale_q1 = tl.broadcast_to(
+                        v_scale_q1_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q1 = tl.broadcast_to(
+                        v_zero_q1_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_scale_q2 = tl.broadcast_to(
+                        v_scale_q2_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q2 = tl.broadcast_to(
+                        v_zero_q2_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_scale_q3 = tl.broadcast_to(
+                        v_scale_q3_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
+                    v_zero_q3 = tl.broadcast_to(
+                        v_zero_q3_t[:, None], (BLOCK_N, BLOCK_D // 4)
+                    )
                 # Cast V scales/zeros to q's dtype ONCE so per-element dequant
                 # below stays in bf16 (saves 2 fp32↔bf16 casts per crumb).
                 v_scale_q0 = v_scale_q0.to(q_q0.dtype)
-                v_zero_q0  = v_zero_q0.to(q_q0.dtype)
+                v_zero_q0 = v_zero_q0.to(q_q0.dtype)
                 v_scale_q1 = v_scale_q1.to(q_q0.dtype)
-                v_zero_q1  = v_zero_q1.to(q_q0.dtype)
+                v_zero_q1 = v_zero_q1.to(q_q0.dtype)
                 v_scale_q2 = v_scale_q2.to(q_q0.dtype)
-                v_zero_q2  = v_zero_q2.to(q_q0.dtype)
+                v_zero_q2 = v_zero_q2.to(q_q0.dtype)
                 v_scale_q3 = v_scale_q3.to(q_q0.dtype)
-                v_zero_q3  = v_zero_q3.to(q_q0.dtype)
+                v_zero_q3 = v_zero_q3.to(q_q0.dtype)
                 # Dequantize INT2 V inline: unpack 4 crumbs per-group.
                 v_q0 = ((v_packed & 0x03).to(q_q0.dtype) - v_zero_q0) * v_scale_q0
-                v_q1 = (((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_q1) * v_scale_q1
-                v_q2 = (((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_q2) * v_scale_q2
-                v_q3 = (((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_q3) * v_scale_q3
+                v_q1 = (
+                    ((v_packed >> 2) & 0x03).to(q_q0.dtype) - v_zero_q1
+                ) * v_scale_q1
+                v_q2 = (
+                    ((v_packed >> 4) & 0x03).to(q_q0.dtype) - v_zero_q2
+                ) * v_scale_q2
+                v_q3 = (
+                    ((v_packed >> 6) & 0x03).to(q_q0.dtype) - v_zero_q3
+                ) * v_scale_q3
             else:
                 offs_sz_v_1d = kv_loc * stride_sz_vbs + cur_kv_head * stride_sz_vh
                 v_scale_1d = tl.load(
@@ -3274,9 +3407,7 @@ def _decode_att_m_fwd_quant_int2(
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
-    group_size = _get_shared_kv_scale_group_size(
-        Lk, Lv, k_scales_zeros, v_scales_zeros
-    )
+    group_size = _get_shared_kv_scale_group_size(Lk, Lv, k_scales_zeros, v_scales_zeros)
 
     _fwd_kernel_stage1_quant_int2[grid](
         q,
@@ -3353,16 +3484,14 @@ def _decode_grouped_att_m_fwd_quant_int2(
     L = k_buffer.shape[-1] * 4
     assert v_buffer.shape[-1] * 4 == L, "INT2 KV cache requires Lk == Lv"
     BLOCK_D = triton.next_power_of_2(L)
-    group_size = _get_shared_kv_scale_group_size(
-        L, L, k_scales_zeros, v_scales_zeros
-    )
+    group_size = _get_shared_kv_scale_group_size(L, L, k_scales_zeros, v_scales_zeros)
 
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     MAX_KV_SPLITS = max_kv_splits
 
-    # Tile heuristic 
+    # Tile heuristic
     if kv_group_num <= 8:
         if batch >= 16:
             _bn_default, _bh_default, _nw_default = 32, 4, 1
@@ -3561,6 +3690,7 @@ def decode_attention_fwd_grouped_quant_int2(
 # _unified_stage2 内の任意引数としてのみ残す。
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _fwd_kernel_stage2_unified(
     Mid_O,
@@ -3631,6 +3761,7 @@ def _fwd_kernel_stage2_unified(
             lse_out,
         )
 
+
 def _unified_stage2(
     attn_logits: torch.Tensor,
     attn_lse: torch.Tensor,
@@ -3664,6 +3795,7 @@ def _unified_stage2(
         num_stages=2,
         **extra_kargs,
     )
+
 
 def decode_attention_fwd_int2_unified(
     q,

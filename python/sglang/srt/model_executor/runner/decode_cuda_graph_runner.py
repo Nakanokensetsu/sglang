@@ -57,7 +57,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.mem_cache.unified_kv_pool import (
-    UnifiedInt2HPKVPool,
     resolve_mixed_kv_pool,
 )
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (

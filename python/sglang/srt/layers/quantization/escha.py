@@ -30,7 +30,7 @@ Serving requirements:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -45,9 +45,12 @@ logger = logging.getLogger(__name__)
 
 # the reference codec (MIT) fused code decode+GEMM kernel. Imported lazily-safe so the
 # module loads even where the reference codec is absent (apply() then falls back / errors).
+# NOTE: the import that would bind `_ref_ext` has never been present in this
+# fork, so the NameError below is caught every time and HAS_REF is always False
+# — the reference kernel is not used (startup logs `ref_gemm: NO`). Kept as-is
+# rather than "fixed": wiring the import would silently switch the GEMM path.
 try:
-
-    HAS_REF = hasattr(_ref_ext, "ref_gemm")
+    HAS_REF = hasattr(_ref_ext, "ref_gemm")  # noqa: F821
 except Exception:  # pragma: no cover
     _ref_ext = None
     HAS_REF = False
@@ -106,6 +109,7 @@ def _escham_multi_max_m() -> int:
         except Exception:  # older kernel build without the probe
             _ESCHAM_MULTI_MAX_M = min(16, _escham_max_m())
     return _ESCHAM_MULTI_MAX_M
+
 
 # Benchmark/debug knob: force the ref_gemm path (skip our escham kernel) to A/B the
 # two decode kernels in an identical serving setup. Read once at import.
@@ -183,8 +187,8 @@ _KGROUP = _os.environ.get("ESCHA_KGROUP", "1") not in ("0", "", "false", "False"
 # opt-outs, and "fused" degrades to "recon" automatically if the installed
 # escha predates the escham_code_gemm op.
 _PREFILL_MODE = _os.environ.get("ESCHA_PREFILL", "fused").strip().lower()
-HAS_REF_RECON = HAS_REF and hasattr(_ref_ext, "reconstruct") and hasattr(
-    _ref_ext, "escha_t128"
+HAS_REF_RECON = (
+    HAS_REF and hasattr(_ref_ext, "reconstruct") and hasattr(_ref_ext, "escha_t128")
 )
 
 # fp16 ACCUMULATE for the prefill GEMM only (save/restore around the matmul).
@@ -194,7 +198,10 @@ HAS_REF_RECON = HAS_REF and hasattr(_ref_ext, "reconstruct") and hasattr(
 # quality gate. Measured deviation vs the fp32-acc recon output: 2.6e-3..3.7e-3
 # mean relative, ~8x the fp32-acc path's own deviation from ref_gemm.
 _PREFILL_FP16ACC = _os.environ.get("ESCHA_PREFILL_FP16ACC", "0") not in (
-    "0", "", "false", "False",
+    "0",
+    "",
+    "false",
+    "False",
 )
 
 # ---------------------------------------------------------------------------
@@ -277,7 +284,10 @@ def _a_half_cached(layer, i: int, dtype):
         cache = layer._escha_a_half = {}
     hit = cache.get(i)
     if hit is None or hit[0].dtype != dtype:
-        hit = (layer.escha_shard_s_in[i].to(dtype), layer.escha_shard_s_out[i].to(dtype))
+        hit = (
+            layer.escha_shard_s_in[i].to(dtype),
+            layer.escha_shard_s_out[i].to(dtype),
+        )
         cache[i] = hit
     return hit
 
@@ -315,8 +325,14 @@ class EschaTensorParam(BasevLLMParameter):
     shard's tensor is stored in a Python list rather than asserting one shape.
     """
 
-    def __init__(self, num_shards: int, suffix: str = "",
-                 is_row_parallel: bool = False, owner_layer=None, **kwargs):
+    def __init__(
+        self,
+        num_shards: int,
+        suffix: str = "",
+        is_row_parallel: bool = False,
+        owner_layer=None,
+        **kwargs,
+    ):
         self.qkv_idxs = {"q": 0, "k": 1, "v": 2}
         self._num_shards = num_shards
         self._shards: list = [None] * num_shards
@@ -335,19 +351,20 @@ class EschaTensorParam(BasevLLMParameter):
     # shape (dim, width)". Reported by @ginerJuanUdesa (escha-tp-fix-qwen3dense).
     def _tp(self):
         try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank as _r
             from sglang.srt.distributed import (
-                get_tensor_model_parallel_rank as _r,
                 get_tensor_model_parallel_world_size as _s,
             )
+
             return _r(), _s()
         except Exception:  # tests / non-distributed
             return 0, 1
 
     def _slice(self, t, axis: int, r: int, s: int):
         tot = t.shape[axis]
-        assert tot % s == 0, (
-            f"escha suffix {self._suffix} dim {axis}={tot} not divisible by tp {s}"
-        )
+        assert (
+            tot % s == 0
+        ), f"escha suffix {self._suffix} dim {axis}={tot} not divisible by tp {s}"
         per = tot // s
         # escha_code is (IC//16, OC//16, 16*K), so 128 IC/OC elements = 8 rows/cols
         # here. The escham kernels gate on IC % 128 == 0 and OC % 128 == 0 (_escham_covered);
@@ -373,9 +390,9 @@ class EschaTensorParam(BasevLLMParameter):
         if self._suffix == "escha_config":
             new = t.clone()
             idx = 4 if self._is_row_parallel else 5
-            assert int(new[idx]) % s == 0, (
-                f"escha_config dim {idx}={int(new[idx])} not divisible by tp {s}"
-            )
+            assert (
+                int(new[idx]) % s == 0
+            ), f"escha_config dim {idx}={int(new[idx])} not divisible by tp {s}"
             new[idx] = int(new[idx]) // s
             return new
         if self._is_row_parallel:
@@ -400,7 +417,9 @@ class EschaTensorParam(BasevLLMParameter):
         if t is None:
             return
         r, s = self._tp()
-        sub_all = getattr(self._owner_layer, "_escha_pretp_output_partition_sizes", None)
+        sub_all = getattr(
+            self._owner_layer, "_escha_pretp_output_partition_sizes", None
+        )
         assert sub_all, "fused merged linear: no pretp output partition sizes"
         # 2026-09-18 自前移植: sglang 0.5.19 は分離チェックポイントを融合レイヤへ読む際、
         # どのシャードに入れるかを loaded_shard_id で指定する
@@ -409,15 +428,15 @@ class EschaTensorParam(BasevLLMParameter):
         # よって「全シャード」ではなく**指定されたシャードだけ**を対象にする。
         if shard_ids is None:
             shard_ids = tuple(range(self._num_shards))
-            assert len(sub_all) == self._num_shards, (
-                f"fused merged linear: expected {self._num_shards} sub sizes, got {sub_all}"
-            )
+            assert (
+                len(sub_all) == self._num_shards
+            ), f"fused merged linear: expected {self._num_shards} sub sizes, got {sub_all}"
         sub = [sub_all[i] for i in shard_ids]
         tgt = list(shard_ids)
         if self._suffix == "escha_config":
-            assert int(t[5]) == sum(sub), (
-                f"fused escha_config OC {int(t[5])} != sum(sub sizes) {sum(sub)}"
-            )
+            assert int(t[5]) == sum(
+                sub
+            ), f"fused escha_config OC {int(t[5])} != sum(sub sizes) {sum(sub)}"
             for i, ss in enumerate(sub):
                 new = t.clone()
                 assert ss % s == 0, f"sub size {ss} not divisible by tp {s}"
@@ -427,19 +446,26 @@ class EschaTensorParam(BasevLLMParameter):
         if self._suffix == "escha_code":
             # 2026-09-18 デバッグ: 0.5.19 で sub と実テンソルが食い違う件の調査
             import os as _dbg_os
+
             if _dbg_os.environ.get("ESCHA_DEBUG_SPLIT") == "1":
-                print(f"[ESCHA_SPLIT] layer={type(self._owner_layer).__name__} "
-                      f"suffix={self._suffix} sub={sub} num_shards={self._num_shards} "
-                      f"t.shape={tuple(t.shape)} expect_sum={sum(ss//16 for ss in sub)}",
-                      flush=True)
+                print(
+                    f"[ESCHA_SPLIT] layer={type(self._owner_layer).__name__} "
+                    f"suffix={self._suffix} sub={sub} num_shards={self._num_shards} "
+                    f"t.shape={tuple(t.shape)} expect_sum={sum(ss//16 for ss in sub)}",
+                    flush=True,
+                )
             for i, p in enumerate(torch.split(t, [ss // 16 for ss in sub], dim=1)):
-                self._shards[tgt[i]] = self._slice(p, 1, r, s) if s > 1 else p.contiguous()
+                self._shards[tgt[i]] = (
+                    self._slice(p, 1, r, s) if s > 1 else p.contiguous()
+                )
             return
         if self._suffix in ("escha_rout", "escha_s_out"):
             for i, p in enumerate(torch.split(t, list(sub), dim=0)):
-                self._shards[tgt[i]] = self._slice(p, 0, r, s) if s > 1 else p.contiguous()
+                self._shards[tgt[i]] = (
+                    self._slice(p, 0, r, s) if s > 1 else p.contiguous()
+                )
             return
-        for i in range(self._num_shards):   # rin / s_in: IC-dim, replicated
+        for i in range(self._num_shards):  # rin / s_in: IC-dim, replicated
             self._shards[i] = t
 
     def _escha_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
@@ -457,9 +483,12 @@ class EschaTensorParam(BasevLLMParameter):
             param._split_fused_into_shards(loaded_weight, shard_ids=loaded_shard_id)
             return
         if param._tp()[1] > 1:
-            if (loaded_shard_id is None and param._num_shards > 1
-                    and not param._is_row_parallel
-                    and _os.environ.get("ESCHA_TP_NAIVE") != "1"):
+            if (
+                loaded_shard_id is None
+                and param._num_shards > 1
+                and not param._is_row_parallel
+                and _os.environ.get("ESCHA_TP_NAIVE") != "1"
+            ):
                 param._split_fused_into_shards(loaded_weight)
                 return
         idx = 0 if loaded_shard_id is None else param._shard_id_as_int(loaded_shard_id)
@@ -526,7 +555,7 @@ class DIEschaConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "DIEschaConfig":
+    def from_config(cls, config: Dict[str, Any]) -> DIEschaConfig:
         global_cfg = config.get("global_config", {})
         codebook = global_cfg.get("codebook", config.get("codebook", "cbA"))
         bits = global_cfg.get("bits", config.get("bits", 2.0))
@@ -599,6 +628,7 @@ class DIEschaInt8EmbeddingMethod:
         **extra_weight_attrs,
     ):
         import torch as _torch
+
         from sglang.srt.utils.common import set_weight_attrs
 
         num = sum(output_partition_sizes)
@@ -625,9 +655,7 @@ class DIEschaInt8EmbeddingMethod:
         ).unsqueeze(1)
         del layer._parameters["weight_int8"]
         del layer._parameters["weight_scale"]
-        layer.register_parameter(
-            "weight", _torch.nn.Parameter(w, requires_grad=False)
-        )
+        layer.register_parameter("weight", _torch.nn.Parameter(w, requires_grad=False))
 
     def apply(self, layer, x, bias=None):
         import torch.nn.functional as _F
@@ -682,6 +710,7 @@ class DIEschaLinearMethod(LinearMethodBase):
             from sglang.srt.distributed import (
                 get_tensor_model_parallel_world_size as _tps,
             )
+
             tp_size = _tps()
         except Exception:
             tp_size = 1
@@ -775,8 +804,11 @@ class DIEschaLinearMethod(LinearMethodBase):
                     tiles_n.append(oc // 16)
                 cb = layer.escha_shard_configs[idx[0]][3]
                 return (
-                    torch.tensor([layer.escha_shard_code[i].data_ptr() for i in idx],
-                                 dtype=torch.int64, device=device),
+                    torch.tensor(
+                        [layer.escha_shard_code[i].data_ptr() for i in idx],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
                     torch.stack([layer.escha_shard_rin[i] for i in idx]).contiguous(),
                     torch.stack([layer.escha_shard_s_in[i] for i in idx]).contiguous(),
                     torch.cat([layer.escha_shard_rout[i] for i in idx]).contiguous(),
@@ -799,12 +831,15 @@ class DIEschaLinearMethod(LinearMethodBase):
             # M=16 decode step, so this is ~1.39x on the whole step.
             # One launch per K, results sliced back into original shard order.
             layer.escha_multi_kgroups = None
-            _base_ok = (cfgs_real and len(shards_real) == len(cfgs_real)
-                        and len({c[3] for c in cfgs_real}) == 1
-                        and len({c[4] for c in cfgs_real}) == 1
-                        and cfgs_real[0][4] % 128 == 0
-                        and all(c[5] % 128 == 0 for c in cfgs_real)
-                        and all(c[1] in (2, 3) for c in cfgs_real))
+            _base_ok = (
+                cfgs_real
+                and len(shards_real) == len(cfgs_real)
+                and len({c[3] for c in cfgs_real}) == 1
+                and len({c[4] for c in cfgs_real}) == 1
+                and cfgs_real[0][4] % 128 == 0
+                and all(c[5] % 128 == 0 for c in cfgs_real)
+                and all(c[1] in (2, 3) for c in cfgs_real)
+            )
             if _base_ok and len({c[1] for c in cfgs_real}) > 1:
                 by_k: Dict[int, list] = {}
                 for i, c in enumerate(layer.escha_shard_configs):
@@ -813,27 +848,40 @@ class DIEschaLinearMethod(LinearMethodBase):
                 groups = []
                 for kk in sorted(by_k):
                     gidx = by_k[kk]
-                    groups.append((_build_multi(gidx), kk, tuple(gidx),
-                                   tuple(layer.escha_shard_configs[i][5] for i in gidx)))
+                    groups.append(
+                        (
+                            _build_multi(gidx),
+                            kk,
+                            tuple(gidx),
+                            tuple(layer.escha_shard_configs[i][5] for i in gidx),
+                        )
+                    )
                 layer.escha_multi_kgroups = groups
-                logger.debug("escha: K-grouped multi for a mixed-K layer: %s",
-                             {k: len(v) for k, v in by_k.items()})
+                logger.debug(
+                    "escha: K-grouped multi for a mixed-K layer: %s",
+                    {k: len(v) for k, v in by_k.items()},
+                )
 
-            if (cfgs_real and len(shards_real) == len(cfgs_real)
-                    # Uniform K per launch group (2 or 3): the merged kernel takes
-                    # ONE K template arg, so shards of differing K cannot share a
-                    # launch. Mixed-bit models (mix247/mix270) put K=3 on FFN
-                    # tensors and K=2 on attention/SSM, and K is per-tensor, so a
-                    # single layer's shards are uniform in practice; a layer that
-                    # ever mixed would simply fall to the per-shard path.
-                    and len({c[1] for c in cfgs_real}) == 1
-                    and cfgs_real[0][1] in (2, 3)
-                    and len({c[3] for c in cfgs_real}) == 1              # one codebook
-                    and len({c[4] for c in cfgs_real}) == 1              # shared IC
-                    and cfgs_real[0][4] % 128 == 0
-                    and all(c[5] % 128 == 0 for c in cfgs_real)):
+            if (
+                cfgs_real
+                and len(shards_real) == len(cfgs_real)
+                # Uniform K per launch group (2 or 3): the merged kernel takes
+                # ONE K template arg, so shards of differing K cannot share a
+                # launch. Mixed-bit models (mix247/mix270) put K=3 on FFN
+                # tensors and K=2 on attention/SSM, and K is per-tensor, so a
+                # single layer's shards are uniform in practice; a layer that
+                # ever mixed would simply fall to the per-shard path.
+                and len({c[1] for c in cfgs_real}) == 1
+                and cfgs_real[0][1] in (2, 3)
+                and len({c[3] for c in cfgs_real}) == 1  # one codebook
+                and len({c[4] for c in cfgs_real}) == 1  # shared IC
+                and cfgs_real[0][4] % 128 == 0
+                and all(c[5] % 128 == 0 for c in cfgs_real)
+            ):
                 layer.escha_multi_k = int(cfgs_real[0][1])
-                idx = [i for i, c in enumerate(layer.escha_shard_configs) if c is not None]
+                idx = [
+                    i for i, c in enumerate(layer.escha_shard_configs) if c is not None
+                ]
                 blk_shard, blk_n0, tiles_n = [], [], []
                 for j, i in enumerate(idx):
                     oc = layer.escha_shard_configs[i][5]
@@ -843,8 +891,11 @@ class DIEschaLinearMethod(LinearMethodBase):
                     tiles_n.append(oc // 16)
                 cb_id = cfgs_real[0][3]
                 layer.escha_multi = (
-                    torch.tensor([layer.escha_shard_code[i].data_ptr() for i in idx],
-                                 dtype=torch.int64, device=device),
+                    torch.tensor(
+                        [layer.escha_shard_code[i].data_ptr() for i in idx],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
                     torch.stack([layer.escha_shard_rin[i] for i in idx]).contiguous(),
                     torch.stack([layer.escha_shard_s_in[i] for i in idx]).contiguous(),
                     torch.cat([layer.escha_shard_rout[i] for i in idx]).contiguous(),
@@ -867,14 +918,21 @@ class DIEschaLinearMethod(LinearMethodBase):
         if _NO_REF and not ref_free:
             raise RuntimeError(
                 "ESCHA_STRICT set but this layer cannot run escham-only: "
-                f"covered={covered} HAS_ESCHAM={HAS_ESCHAM} HAS_ESCHAM_GEMM={HAS_ESCHAM_GEMM}")
-        logger.info("Loaded %d escha shards (ref_gemm: %s, multi: %s, prefill: %s%s, ref-free: %s)",
-                    n_real, "YES" if HAS_REF else "NO",
-                    "YES" if layer.escha_multi is not None else "no",
-                    _PREFILL_MODE if (_PREFILL_MODE != "recon" or HAS_REF_RECON)
-                    else "recon-UNAVAILABLE->ref",
-                    " +fp16acc" if (_PREFILL_MODE == "recon" and _PREFILL_FP16ACC) else "",
-                    "YES" if ref_free else "no")
+                f"covered={covered} HAS_ESCHAM={HAS_ESCHAM} HAS_ESCHAM_GEMM={HAS_ESCHAM_GEMM}"
+            )
+        logger.info(
+            "Loaded %d escha shards (ref_gemm: %s, multi: %s, prefill: %s%s, ref-free: %s)",
+            n_real,
+            "YES" if HAS_REF else "NO",
+            "YES" if layer.escha_multi is not None else "no",
+            (
+                _PREFILL_MODE
+                if (_PREFILL_MODE != "recon" or HAS_REF_RECON)
+                else "recon-UNAVAILABLE->ref"
+            ),
+            " +fp16acc" if (_PREFILL_MODE == "recon" and _PREFILL_FP16ACC) else "",
+            "YES" if ref_free else "no",
+        )
 
     # ------------------------------------------------------------------ apply
 
@@ -887,8 +945,14 @@ class DIEschaLinearMethod(LinearMethodBase):
 
         L, K, V, cb_id, IC, OC = cfg
         w = reconstruct_deploy_weight(
-            layer.escha_shard_code[i], layer.escha_shard_rin[i], layer.escha_shard_rout[i],
-            IC, OC, K, cb_id == 1, cb_id == 2,
+            layer.escha_shard_code[i],
+            layer.escha_shard_rin[i],
+            layer.escha_shard_rout[i],
+            IC,
+            OC,
+            K,
+            cb_id == 1,
+            cb_id == 2,
         )  # (IC, OC) fp16
         layer.escha_shard_dense_fallback[i] = w.contiguous()
         return layer.escha_shard_dense_fallback[i]
@@ -915,17 +979,22 @@ class DIEschaLinearMethod(LinearMethodBase):
         # gate_up); uniform layers take the single-launch path below unchanged.
         kg = getattr(layer, "escha_multi_kgroups", None)
         _m_lo_kg = 1 if _MULTI_M1 else 2
-        if (kg is not None and _KGROUP and not _FORCE_REF
-                and _m_lo_kg <= batch <= _escham_multi_max_m()):
+        if (
+            kg is not None
+            and _KGROUP
+            and not _FORCE_REF
+            and _m_lo_kg <= batch <= _escham_multi_max_m()
+        ):
             try:
                 xin = x_2d.to(torch.half).contiguous()
                 pieces = {}
                 for meta, kk, gidx, ocs in kg:
                     y = torch.ops.escha.escham_multi_gemv(
-                        xin, *meta[:9], kk, meta[9], meta[10], 0)
+                        xin, *meta[:9], kk, meta[9], meta[10], 0
+                    )
                     off = 0
                     for i, oc in zip(gidx, ocs):
-                        pieces[i] = y[:, off:off + oc]
+                        pieces[i] = y[:, off : off + oc]
                         off += oc
                 out = torch.cat([pieces[i] for i in sorted(pieces)], dim=-1).to(x_dtype)
                 out = out.reshape(orig_shape[:-1] + (out.shape[-1],))
@@ -950,11 +1019,19 @@ class DIEschaLinearMethod(LinearMethodBase):
         # only if bitwise-identical to the per-shard baseline (split-K grouping
         # must match) AND faster end-to-end.
         _m_lo = 1 if _MULTI_M1 else 2
-        if (qm is not None and not _FORCE_REF and _m_lo <= batch <= _escham_multi_max_m()):
+        if (
+            qm is not None
+            and not _FORCE_REF
+            and _m_lo <= batch <= _escham_multi_max_m()
+        ):
             try:
                 out = torch.ops.escha.escham_multi_gemv(
-                    x_2d.to(torch.half).contiguous(), *qm[:9],
-                    getattr(layer, "escha_multi_k", 2), qm[9], qm[10], 0,
+                    x_2d.to(torch.half).contiguous(),
+                    *qm[:9],
+                    getattr(layer, "escha_multi_k", 2),
+                    qm[9],
+                    qm[10],
+                    0,
                 ).to(x_dtype)
                 out = out.reshape(orig_shape[:-1] + (out.shape[-1],))
                 if bias is not None:
@@ -985,13 +1062,20 @@ class DIEschaLinearMethod(LinearMethodBase):
         # Under ESCHA_STRICT the fused escham_code_gemm path is forced
         # regardless of ESCHA_PREFILL — a stale `ESCHA_PREFILL=ref`
         # (pinned by the old conservative profile) must not reintroduce ref_gemm.
-        use_fused = (_PREFILL_MODE == "fused" or _NO_REF) and HAS_ESCHAM_GEMM and _large_m
+        use_fused = (
+            (_PREFILL_MODE == "fused" or _NO_REF) and HAS_ESCHAM_GEMM and _large_m
+        )
         # "fused" degrades to "recon" when the installed escha predates
         # the escham_code_gemm op — otherwise a stale kernel build would silently
         # drop the default all the way back to ref (2.7x slower).
-        use_recon = (_large_m and HAS_REF_RECON
-                     and (_PREFILL_MODE == "recon"
-                          or (_PREFILL_MODE == "fused" and not HAS_ESCHAM_GEMM)))
+        use_recon = (
+            _large_m
+            and HAS_REF_RECON
+            and (
+                _PREFILL_MODE == "recon"
+                or (_PREFILL_MODE == "fused" and not HAS_ESCHAM_GEMM)
+            )
+        )
         # fp16-accumulate is toggled ONCE around the whole shard loop rather than
         # per matmul: it flips a PROCESS-GLOBAL cuBLAS math-mode setting, and doing
         # that ~400x per prefill chunk is untested churn. The first fp16acc serving
@@ -1004,8 +1088,9 @@ class DIEschaLinearMethod(LinearMethodBase):
             _acc_prev = torch.backends.cuda.matmul.allow_fp16_accumulation
             torch.backends.cuda.matmul.allow_fp16_accumulation = True
         try:
-            out_parts = self._apply_shards(layer, x_2d, batch, x_dtype, use_recon,
-                                           use_fused)
+            out_parts = self._apply_shards(
+                layer, x_2d, batch, x_dtype, use_recon, use_fused
+            )
         finally:
             if _acc_prev is not None:
                 torch.backends.cuda.matmul.allow_fp16_accumulation = _acc_prev
@@ -1013,21 +1098,26 @@ class DIEschaLinearMethod(LinearMethodBase):
         if not out_parts:
             # 2026-09-18 デバッグ: どの層でシャードが空になるか特定する
             import os as _d
+
             if _d.environ.get("ESCHA_DEBUG_SPLIT") == "1":
                 _pfx = getattr(layer, "prefix", "?")
                 _cfgs = getattr(layer, "escha_shard_configs", None)
                 _code = getattr(layer, "escha_shard_code", None)
-                print(f"[ESCHA_EMPTY] prefix={_pfx} configs={_cfgs} "
-                      f"code_is_none={[c is None for c in (_code or [])]}", flush=True)
-            raise RuntimeError(f"escha: no shards built for layer {getattr(layer,'prefix','?')}")
+                print(
+                    f"[ESCHA_EMPTY] prefix={_pfx} configs={_cfgs} "
+                    f"code_is_none={[c is None for c in (_code or [])]}",
+                    flush=True,
+                )
+            raise RuntimeError(
+                f"escha: no shards built for layer {getattr(layer,'prefix','?')}"
+            )
         out = torch.cat(out_parts, dim=-1) if len(out_parts) > 1 else out_parts[0]
         out = out.reshape(orig_shape[:-1] + (out.shape[-1],))
         if bias is not None:
             out = out + bias
         return out
 
-    def _apply_shards(self, layer, x_2d, batch, x_dtype, use_recon,
-                      use_fused=False):
+    def _apply_shards(self, layer, x_2d, batch, x_dtype, use_recon, use_fused=False):
         """Per-shard kernel dispatch; returns the parts for the caller to concat.
 
         Split out of apply() only so the fp16-accumulate toggle can wrap the whole
@@ -1057,13 +1147,26 @@ class DIEschaLinearMethod(LinearMethodBase):
             # mixed-bit work (escham_gemv_bw_kernel / escham_code_gemm_kernel /
             # escham_multi_gemv_*), gated by tests/test_dense_k3_parity.py which
             # holds K=2 BIT-IDENTICAL and checks K=3 against escham_reconstruct.
-            if (HAS_ESCHAM and not _FORCE_REF and K in (2, 3) and batch <= _escham_max_m()
-                    and IC % 128 == 0 and OC % 128 == 0):
+            if (
+                HAS_ESCHAM
+                and not _FORCE_REF
+                and K in (2, 3)
+                and batch <= _escham_max_m()
+                and IC % 128 == 0
+                and OC % 128 == 0
+            ):
                 try:
                     part = torch.ops.escha.escham_decode_gemv(
-                        x_2d.to(torch.half).contiguous(), code, rin, rout,
-                        layer.escha_shard_s_in[i], layer.escha_shard_s_out[i],
-                        OC, K, bool(cb_id == 1), bool(cb_id == 2),
+                        x_2d.to(torch.half).contiguous(),
+                        code,
+                        rin,
+                        rout,
+                        layer.escha_shard_s_in[i],
+                        layer.escha_shard_s_out[i],
+                        OC,
+                        K,
+                        bool(cb_id == 1),
+                        bool(cb_id == 2),
                     ).to(x_dtype)
                 except Exception:  # pragma: no cover
                     if _NO_REF:
@@ -1076,13 +1179,25 @@ class DIEschaLinearMethod(LinearMethodBase):
             # Prefill alternative #1: the fused code GEMM (one launch, no fp16
             # weight materialised at all — so it also removes the recon path's
             # transient (IC,OC) buffer, which matters under the 22 GB cap).
-            if (part is None and use_fused and K in (2, 3)
-                    and IC % 128 == 0 and OC % 128 == 0):
+            if (
+                part is None
+                and use_fused
+                and K in (2, 3)
+                and IC % 128 == 0
+                and OC % 128 == 0
+            ):
                 try:
                     part = torch.ops.escha.escham_code_gemm(
-                        x_2d.to(torch.half).contiguous(), code, rin, rout,
-                        layer.escha_shard_s_in[i], layer.escha_shard_s_out[i],
-                        OC, K, bool(cb_id == 1), bool(cb_id == 2),
+                        x_2d.to(torch.half).contiguous(),
+                        code,
+                        rin,
+                        rout,
+                        layer.escha_shard_s_in[i],
+                        layer.escha_shard_s_out[i],
+                        OC,
+                        K,
+                        bool(cb_id == 1),
+                        bool(cb_id == 2),
                         _acc_mode_for(IC),
                     ).to(x_dtype)
                 except Exception:  # pragma: no cover — fall through to recon/ref
@@ -1106,14 +1221,26 @@ class DIEschaLinearMethod(LinearMethodBase):
                     f"escha: shard {i} (batch={batch}) left the escham kernel path "
                     "DURING CUDA-graph capture — the ref/recon/dense branches are "
                     "not capturable and would bake wrong arithmetic into the graph. "
-                    "Cap --cuda-graph-bs at torch.ops.escha.escham_decode_gemv_max_m().")
+                    "Cap --cuda-graph-bs at torch.ops.escha.escham_decode_gemv_max_m()."
+                )
             # Prefill alternative #2: transient raw reconstruct + cuBLAS.
             if part is None and (use_recon or use_fused):
                 s_in, s_out = _a_half_cached(layer, i, x_dtype)
                 try:
-                    part = _prefill_recon(x_2d, code, rin, rout, s_in, s_out,
-                                          IC, OC, K, bool(cb_id == 1),
-                                          bool(cb_id == 2), x_dtype)
+                    part = _prefill_recon(
+                        x_2d,
+                        code,
+                        rin,
+                        rout,
+                        s_in,
+                        s_out,
+                        IC,
+                        OC,
+                        K,
+                        bool(cb_id == 1),
+                        bool(cb_id == 2),
+                        x_dtype,
+                    )
                 except Exception:  # pragma: no cover — fall through to ref_gemm
                     part = None
             if part is None and HAS_REF and not _NO_REF:
@@ -1133,8 +1260,16 @@ class DIEschaLinearMethod(LinearMethodBase):
                 C = torch.empty((batch, OC), dtype=torch.half, device=A.device)
                 try:
                     _ref_ext.ref_gemm(
-                        A, code, C, rin, A_had, rout,
-                        -1, bool(cb_id == 1), bool(cb_id == 2), 0,
+                        A,
+                        code,
+                        C,
+                        rin,
+                        A_had,
+                        rout,
+                        -1,
+                        bool(cb_id == 1),
+                        bool(cb_id == 2),
+                        0,
                     )
                     # REVERTED 2026-08-12: the first-3-calls-only NaN-guard
                     # variant (+4% prefill @32K) FAILED the consolidated MATH-500
@@ -1144,7 +1279,7 @@ class DIEschaLinearMethod(LinearMethodBase):
                     # pybind ref_gemm calls. Do not remove without an ref-side
                     # stream-safety fix.
                     if torch.isfinite(C).all():
-                        part = (C.to(x_dtype) * s_out)
+                        part = C.to(x_dtype) * s_out
                 except Exception:  # pragma: no cover
                     part = None
             if part is None:
@@ -1153,7 +1288,8 @@ class DIEschaLinearMethod(LinearMethodBase):
                         f"ESCHA_STRICT: shard {i} (K={K}, IC={IC}, OC={OC}, "
                         f"batch={batch}) fell out of the escham kernel path — the "
                         "strict profile refuses the ref/dense fallback because a "
-                        "silent kernel-route change mid-run un-pairs eval arms.")
+                        "silent kernel-route change mid-run un-pairs eval arms."
+                    )
                 # Dense fallback: (x * s_in) @ W_deploy * s_out
                 s_in, s_out = _a_half_cached(layer, i, x_dtype)
                 w = self._dense_fallback(layer, i, cfg).to(x_dtype)  # (IC, OC)

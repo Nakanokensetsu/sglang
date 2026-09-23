@@ -473,6 +473,9 @@ class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
     OTHER = auto()  # Other reasons to stop adding requests
+    # Not admitted, but only because the mid-prefill capacity is full; later
+    # waiting requests may still fit and must keep being considered.
+    SKIP = auto()
 
 
 class PrefillAdder:
@@ -494,6 +497,9 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        long_prefill_token_threshold: int = 0,
+        max_concurrent_chunked_reqs: int = 1,
+        num_carried_chunked_reqs: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -503,6 +509,8 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        # 2026-09-22 自前追加: 均等配分の分母に使う、このパスの元の予算。
+        self.chunk_budget_total = rem_chunk_tokens
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -516,7 +524,10 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_req = None
+        # Requests this pass leaves mid-prefill. The scheduler carries them
+        # to the next pass; `chunked_reqs_in_batch` is the subset that actually
+        # got a chunk here (a parked request is in neither list's intersection).
+        self.new_chunked_reqs: List[Req] = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -590,6 +601,17 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+        # Per-request prefill ceiling (vLLM's long_prefill_token_threshold):
+        # no request takes more than this many prompt tokens in one pass, so
+        # up to chunked_prefill_size // threshold requests can be mid-prefill
+        # concurrently. 0 disables the cap (one request may drain the pool).
+        self.long_prefill_token_threshold = long_prefill_token_threshold
+        self.num_carried_chunked_reqs = num_carried_chunked_reqs
+        # How many requests may be mid-prefill at once. Mid-prefill requests
+        # pin their computed KV and cannot be retracted, so the bound also
+        # caps the reserved-but-uncomputed KV held for them.
+        self.max_concurrent_chunked_reqs = max_concurrent_chunked_reqs
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -748,6 +770,48 @@ class PrefillAdder:
             CLIP_MAX_NEW_TOKENS,
         )
 
+    def _effective_long_prefill_ceiling(self) -> int:
+        """The per-request prefill ceiling to apply this pass (0 = none).
+
+        2026-09-21 自前追加。上流 PR #34623 は ``long_prefill_token_threshold``
+        を**無条件に**適用するので、作者自身が書いているとおり
+        「待機がいない長文 prefill も F に絞られ、予算を遊ばせたまま B/F 倍
+        遅くなる」(PR 本文 "Known trade-off")。
+
+        譲る相手がいないときに絞る理由はない。待機中の要求があるか、他にも
+        prefill 途中の要求がいるときだけ上限をかける。invariant 側
+        (容量・予約) は無条件のまま触らない: 上限を外した回は長文が予算を
+        使い切るので、そもそも新しいチャンク要求が生まれず容量を超えない。
+
+        ``SGLANG_LONG_PREFILL_CEILING_ALWAYS=1`` で上流どおりの無条件適用に戻せる。
+        """
+        F = self.long_prefill_token_threshold
+        if F <= 0:
+            return 0
+        _ALWAYS = envs.SGLANG_LONG_PREFILL_CEILING_ALWAYS.get()
+        contended = self.waiting_queue_len > 0 or self.num_carried_chunked_reqs > 1
+        if not contended:
+            # 2026-09-22: 非競合でも上限で刻む。単独巡航中に予算8192を丸ごと使うと、
+            # 後から来た要求が「進行中パスの残り」を最大6.7秒待つ。F=2048 の刻みでも
+            # スループットは 1,276 tok/s で 8192 と同じ(実測)なので、刻む損は無い。
+            return F if _ALWAYS else 0
+
+        # 2026-09-22 自前追加: 予算を「いま prefill 中の本数 + 待っている本数」で
+        # 均等に割る。1本しかいなければ予算を丸ごと使うので隙間は生まれず、
+        # 新規が来た瞬間に全員の取り分が自動で縮む。F はその上限として残す
+        # (上限を外すと1本あたりが大きくなりすぎ、後から来た要求の待ちが延びる)。
+        if self.chunk_budget_total:
+            n_active = max(
+                1, self.num_carried_chunked_reqs + max(self.waiting_queue_len, 0)
+            )
+            # 2026-09-22: 本数でちょうど割ると1本あたりが大きすぎ、後から来た要求が
+            # 進行中パスの残りを長く待つ。セッション数に倍率をかけて更に細かく刻む
+            # (既定2 = セッション数の倍で割る)。SGLANG_PREFILL_SPLIT_FACTOR で変更可。
+            _k = max(1, envs.SGLANG_PREFILL_SPLIT_FACTOR.get() or 1)
+            share = max(self.page_size, self.chunk_budget_total // (n_active * _k))
+            return min(F, share)
+        return F
+
     def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
         """Largest page-aligned extend chunk the SWA pool can admit right now,
         keeping a sliding window of headroom below rem_swa_tokens; 0 if not
@@ -839,18 +903,34 @@ class PrefillAdder:
         mamba_gap_reserve: int = 0,
         host_hit_len: int = 0,
         storage_hit_len: int = 0,
+        reserve_total_len: Optional[int] = None,
+        reserve_max_new_tokens: Optional[int] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
+        # Reserve-to-completion: a request left mid-prefill pins its computed
+        # KV and cannot be retracted, so its whole remaining prefill (plus
+        # decode headroom) is charged to the lifetime budget at admission --
+        # not chunk by chunk -- or later admissions can consume the headroom
+        # the request needs to finish and deadlock it. The per-pass budgets
+        # (cur_rem, rem_input, rem_chunk) still see only this pass's chunk.
+        # Defaults keep the non-reserving callers byte-identical.
+        reserve_len = (
+            extend_input_len
+            if reserve_total_len is None
+            else self.ceil_paged_tokens(reserve_total_len)
+        )
+        if reserve_max_new_tokens is None:
+            reserve_max_new_tokens = max_new_tokens
         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
         # immediately (counts against `cur_rem`) and held for the request lifetime
         # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
         self.rem_total_token_offset += (
-            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
+            reserve_len + reserve_max_new_tokens + page_overhead + mamba_gap_reserve
         )
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
@@ -970,6 +1050,23 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _reserve_completion_for_parked_req(self, req: Req) -> None:
+        """Hold a parked mid-prefill request's completion reservation.
+
+        A parked request gets no chunk this pass, but it stays mid-prefill
+        with its computed KV pinned and unretractable. Its whole remaining
+        prefill (plus decode headroom) must stay charged to the lifetime
+        budget, or admissions later in this pass could consume the headroom
+        it needs to finish and deadlock it.
+        """
+        remaining = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        self.rem_total_token_offset += (
+            self.ceil_paged_tokens(remaining)
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + self.page_size
+            + self._mamba_gap_budget_for_req(req)
+        )
+
     def add_chunked_req(self, req: Req):
         # A resumed chunked_req with no input left must keep ownership, but it
         # must not run a zero-token forward: overlap futures expect one output
@@ -990,11 +1087,26 @@ class PrefillAdder:
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
+                if self.rem_chunk_tokens <= 0 and self.long_prefill_token_threshold > 0:
+                    # The per-pass chunk pool is drained (earlier requests
+                    # took it). Park the request: it stays carried and retries
+                    # next pass when the pool refills. It is NOT appended to
+                    # can_run_list, so inflight accounting skips it.
+                    self._reserve_completion_for_parked_req(req)
+                    return req
                 if self.is_hybrid_swa:
+                    if self.long_prefill_token_threshold > 0:
+                        self._reserve_completion_for_parked_req(req)
                     return req
                 _rem_tokens = self.rem_chunk_tokens
             if _rem_tokens <= 0:
                 return req
+
+            # Per-request ceiling, applied to continued chunks as well: one
+            # carried request cannot drain the pool ahead of the others.
+            _ceiling = self._effective_long_prefill_ceiling()
+            if _ceiling > 0:
+                _rem_tokens = min(_rem_tokens, _ceiling)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1014,6 +1126,16 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        # 2026-09-21 自前修正: 上流 #34623 は F>0 なら**無条件に**完走分を先取りする。
+        # 予約が要るのは「チャンク分割されて preempt できなくなる要求」だけで、
+        # 1パスで丸ごと収まる要求(キャッシュヒットした再訪など)には不要。
+        # 無条件にすると並列時の受理が絞られ、実測で並列8の再訪 最遅が
+        # 0.5秒 -> 15.0秒 に悪化した。truncated のときだけ予約する。
+        reserving = (
+            self.long_prefill_token_threshold > 0
+            and self.dllm_config is None
+            and truncated
+        )
         self._update_prefill_budget(
             0,
             req.extend_range.length,
@@ -1024,6 +1146,14 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            # Reserve-to-completion: the lifetime budget carries the whole
+            # remaining prefill + decode headroom, not just this chunk.
+            reserve_total_len=cand_extend_input_len if reserving else None,
+            reserve_max_new_tokens=(
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if reserving
+                else None
+            ),
         )
 
         # Return if chunked prefill not finished
@@ -1046,7 +1176,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, num_chunked_reqs: int):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1127,6 +1257,14 @@ class PrefillAdder:
         ):
             return AddReqResult.OTHER
 
+        # The per-request ceiling composes with the ignore_eos path exactly as
+        # in add_one_req: applied before the chunked/non-chunked split, so a
+        # request under the ceiling still admits whole.
+        chunk_tokens_limit = self.rem_chunk_tokens
+        _ceiling = self._effective_long_prefill_ceiling()
+        if _ceiling > 0 and chunk_tokens_limit is not None:
+            chunk_tokens_limit = min(chunk_tokens_limit, _ceiling)
+
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
@@ -1138,8 +1276,8 @@ class PrefillAdder:
 
             self._add_dllm_req(req, 0)
         elif (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            chunk_tokens_limit is None  # chunked prefill is disabled
+            or cand_extend_input_len <= chunk_tokens_limit  # it is the last chunk
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1159,11 +1297,20 @@ class PrefillAdder:
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if chunk_tokens_limit <= 0:
                 return AddReqResult.OTHER
 
+            # This request would be left mid-prefill. The capacity rule is the
+            # same as in add_one_req, and likewise gated on the ceiling so the
+            # disabled path is byte-identical.
+            if (
+                self.long_prefill_token_threshold > 0
+                and num_chunked_reqs >= self.max_concurrent_chunked_reqs
+            ):
+                return AddReqResult.SKIP
+
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = chunk_tokens_limit
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1173,20 +1320,40 @@ class PrefillAdder:
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
             self.can_run_list.append(req)
-            self.new_chunked_req = req
+            self.new_chunked_reqs.append(req)
+            reserving = self.long_prefill_token_threshold > 0
             self._update_prefill_budget(
                 0,
                 trunc_len,
                 0,
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                # Reserve-to-completion, as in add_one_req: the lifetime
+                # budget carries the whole remaining prefill + decode
+                # headroom from the first chunk on.
+                reserve_total_len=cand_extend_input_len if reserving else None,
+                reserve_max_new_tokens=(
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                    if reserving
+                    else None
+                ),
             )
 
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        num_chunked_reqs: int,
+        truncation_align_size: Optional[int],
     ):
+        """Admit one waiting request.
+
+        ``num_chunked_reqs`` is how many requests are already mid-prefill,
+        counting both those carried over from earlier passes and those this
+        pass has newly chunked. It bounds how many more may be left
+        mid-prefill; see ``max_concurrent_chunked_reqs``.
+        """
         # Nothing to prefill (fully cached); running a zero-token forward breaks
         # the one-output-per-request contract of the overlap scheduler.
         if len(req.full_untruncated_fill_ids) - len(req.prefix_indices) <= 0:
@@ -1202,7 +1369,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, num_chunked_reqs)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1286,6 +1453,18 @@ class PrefillAdder:
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+            _ceiling = self._effective_long_prefill_ceiling()
+            if _ceiling > 0 and chunk_tokens_limit is not None:
+                # vLLM-compatible per-request ceiling: no request prefills
+                # more than the threshold in one pass, so up to
+                # chunked_prefill_size // threshold requests can be
+                # mid-prefill at once. Applied after the post-lock SWA
+                # re-check (the tighter cap wins) and before the
+                # chunked/non-chunked split, so a request whose whole
+                # remaining prompt fits under the threshold still admits
+                # whole rather than being chunked by the ceiling.
+                chunk_tokens_limit = min(chunk_tokens_limit, _ceiling)
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
@@ -1374,6 +1553,22 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # This request would be left mid-prefill. Mid-prefill
+                # requests pin their computed KV and cannot be retracted, so
+                # their count is a hard bound. When every slot is taken,
+                # refuse only THIS request and keep scanning the queue: a
+                # shorter prompt behind it may still fit whole. (Ordered
+                # after the trunc_len check so a drained pool still stops
+                # the pass with OTHER, and gated on the ceiling so the
+                # disabled path is byte-identical -- without the ceiling the
+                # single-slot invariant holds only as a side effect of the
+                # pool being drained.)
+                if (
+                    self.long_prefill_token_threshold > 0
+                    and num_chunked_reqs >= self.max_concurrent_chunked_reqs
+                ):
+                    return AddReqResult.SKIP
+
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
@@ -1403,9 +1598,10 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self.new_chunked_reqs.append(req)
 
                 self._req_inc_lock_ref(req)
+                reserving = self.long_prefill_token_threshold > 0
                 self._update_prefill_budget(
                     prefix_len,
                     trunc_len,
@@ -1414,6 +1610,23 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
+                    # Reserve-to-completion: the lifetime budget carries the
+                    # whole remaining prefill + decode headroom from the first
+                    # chunk on, so later admissions cannot consume the
+                    # headroom this request needs to finish.
+                    reserve_total_len=(
+                        len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                        if reserving
+                        else None
+                    ),
+                    reserve_max_new_tokens=(
+                        min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        )
+                        if reserving
+                        else None
+                    ),
                 )
 
         return self.budget_state()

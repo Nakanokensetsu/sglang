@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 # 2026-09-20 自前変更: 定数だと実機に合わせられない。ホストプールは
 # **モデル重みのロード中**(= MemAvailable が最も低い瞬間)に確保されるので、
@@ -36,9 +37,7 @@ def _host_memory_reserve_bytes() -> int:
         try:
             return int(float(raw) * (1024**3))
         except ValueError:
-            logger.warning(
-                "Ignoring invalid SGLANG_HICACHE_HOST_RESERVE_GB=%r", raw
-            )
+            logger.warning("Ignoring invalid SGLANG_HICACHE_HOST_RESERVE_GB=%r", raw)
     return 10 * (1024**3)
 
 

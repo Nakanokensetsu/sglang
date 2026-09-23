@@ -32,8 +32,6 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
-from sglang.srt.mem_cache.unified_kv_pool import resolve_mixed_kv_pool_from_allocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -52,6 +50,8 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_kv_allocator import UnifiedInt2HPKVAllocator
+from sglang.srt.mem_cache.unified_kv_pool import resolve_mixed_kv_pool_from_allocator
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -461,9 +461,7 @@ class MambaRadixCache(BasePrefixCache):
             # mixed HP+int2 KV (2026-09-19): hybrid GDN の full-attention 側を
             # unified int2 プールに差し替えると、KV スロットの割り当ても
             # UnifiedInt2HPKVAllocator が持つ。
-            or isinstance(
-                params.token_to_kv_pool_allocator, UnifiedInt2HPKVAllocator
-            )
+            or isinstance(params.token_to_kv_pool_allocator, UnifiedInt2HPKVAllocator)
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator

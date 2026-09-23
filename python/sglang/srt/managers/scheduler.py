@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Any,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -281,7 +292,6 @@ from sglang.srt.mem_cache.common import (
     retraction_discard,
 )
 from sglang.srt.mem_cache.unified_kv_pool import (
-    UnifiedInt2HPKVPool,
     resolve_mixed_kv_pool,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -664,6 +674,11 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+
+        # Raise the mid-prefill capacity when the per-request prefill ceiling
+        # is enabled (needs dllm_config and disaggregation_mode to be set).
+        self.init_prefill_concurrency_threshold()
+        self.init_chunked_prefill_concurrency()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1242,8 +1257,15 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
+        # Requests that are mid-prefill: admitted, partially prefilled, and
+        # carried across passes until their prefill completes. Ordered oldest
+        # first, so budget is handed out in admission order.
+        self.chunked_reqs: List[Req] = []
+        self._pending_chunked_abort_reqs: List[Req] = []
+        # Upper bound on how many requests may be mid-prefill at once. Raised
+        # above 1 only when the per-request prefill cap is enabled (see
+        # init_chunked_prefill_concurrency).
+        self.max_concurrent_chunked_reqs = 1
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1283,6 +1305,80 @@ class Scheduler(
         )
         if is_extend:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
+
+    def init_prefill_concurrency_threshold(self):
+        """Derive the per-request prefill ceiling F from a session count N.
+
+        Kept out of `init_chunked_prefill_concurrency` on purpose: that one is
+        upstream #34623's, and leaving it untouched keeps future merges of it
+        conflict-free. This runs first because it writes the threshold that one
+        then reads.
+        """
+        # 2026-09-22 自前追加: 同時に面倒を見るセッション数 N を入口にする。
+        # 予算 chunked_prefill_size を N 等分したものが1本あたりの取り分 F になり、
+        # N 本そろえば隙間なく予算を使い切る。F を直に決めるより意図が明確で、
+        # chunked_prefill_size を変えても N は据え置きで済む。
+        # 既定は並列設定 (max_running_requests) にそのまま紐付ける。並列数を
+        # 変えれば取り分も自動で追従するので、設定が二重に増えない。
+        _n = envs.SGLANG_PREFILL_CONCURRENCY.get()
+        # 既定は並列セッション制限数そのもの。2026-09-23: 以前は x2 にしていたが、
+        # 1本あたりの取り分が常に小さすぎて予算が余っていた(実測: 8本同時でも
+        # 8x409=3272 / 8192 = 40%しか使わない)。パスは大きいほど効率が良く
+        # (409 -> 697 tok/s、3272 -> 1208、8192 -> 約1270)、余らせるのは実損。
+        # 制限いっぱいの本数でちょうど予算を使い切る値にする。
+        # getattr: このメソッドを Scheduler の組み立て途中(モック含む)から呼ぶ経路では
+        # max_running_requests がまだ無い。その場合は N 逆算を諦めて CLI 値に従う。
+        _limit = getattr(self, "max_running_requests", None)
+        if _n is None and _limit:
+            _n = max(1, int(_limit))
+        # さらに細かく刻みたいときの分割係数 K。F = 予算 / (N * K)。
+        # 小さいほど短文の待ちは縮むが、パス数が増えて長文の prefill が落ちる
+        # (実測: F=1024 で 1,216 tok/s、F=512 で 1,098 tok/s = -14%)。
+        _k = max(1, envs.SGLANG_PREFILL_SPLIT_FACTOR.get() or 1)
+        if _n is not None and _n >= 1 and self.chunked_prefill_size:
+            _derived = max(1, self.chunked_prefill_size // (_n * _k))
+            get_context().override(
+                "prefill_concurrency", long_prefill_token_threshold=_derived
+            )
+            logger.info(
+                f"Prefill concurrency N={_n}: long_prefill_token_threshold="
+                f"{_derived} (chunked_prefill_size={self.chunked_prefill_size})."
+            )
+
+    def init_chunked_prefill_concurrency(self):
+        """Raise the mid-prefill capacity when the per-request ceiling is on.
+
+        With long_prefill_token_threshold F > 0, one pass hands at most F
+        prompt tokens to any single request, so up to
+        chunked_prefill_size // F requests can be mid-prefill at once
+        instead of one long prompt monopolizing the prefill budget.
+
+        Concurrency stays at 1 where the single-slot invariant is still
+        load-bearing: disagg prefill (the mixin shares this state and its KV
+        transfer bookkeeping assumes one in-flight chunk), PP > 1 (microbatch
+        accounting), and dLLM (the staging queue owns its mid-prefill
+        requests). Speculative decoding needs no gate: DSpark/EAGLE track
+        per-request state and never read the slot count.
+        """
+        threshold = get_schedule().long_prefill_token_threshold
+        if (
+            threshold <= 0
+            or self.chunked_prefill_size is None
+            or self.disaggregation_mode == DisaggregationMode.PREFILL
+            or self.ps.pp_size > 1
+            or self.dllm_config is not None
+        ):
+            return
+        self.max_concurrent_chunked_reqs = max(
+            1, self.chunked_prefill_size // threshold
+        )
+        if self.max_concurrent_chunked_reqs > 1:
+            logger.info(
+                f"Concurrent chunked prefill enabled: up to "
+                f"{self.max_concurrent_chunked_reqs} requests mid-prefill "
+                f"(chunked_prefill_size={self.chunked_prefill_size}, "
+                f"long_prefill_token_threshold={threshold})."
+            )
 
     def init_metrics_reporter(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -2335,7 +2431,7 @@ class Scheduler(
             ),
             get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
             get_stats=lambda: self.metrics_reporter.stats,
-            get_chunked_req=lambda: self.chunked_req,
+            get_chunked_reqs=lambda: self.chunked_reqs,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
@@ -3276,48 +3372,87 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def _contains_last_prefill_chunk(self, can_run_list: List[Req]) -> bool:
+        """Whether any request in this batch consumes the sampled token.
+
+        False only for a batch of pure middle chunks, whose sampled tokens
+        nobody reads -- the case that lets PP skip output communication
+        entirely (`_pp_can_skip_output_comm`).
+
+        Derived from batch membership rather than from the batch size. The
+        former `len(can_run_list) != 1` was a proxy for "the chunked request is
+        the sole member" and misreads the parked case: a request is mid-prefill
+        but was not admitted to the batch (see `_count_inflight_chunk`), so the
+        one request present does finish its prefill and does consume its token.
+        """
+        mid_prefill = set(self.chunked_reqs)
+        return any(req not in mid_prefill for req in can_run_list)
+
+    def _count_inflight_chunk(self, batch_reqs: AbstractSet[Req]) -> None:
+        """Mark mid-prefill requests as having a chunk in flight this batch.
+
+        Only counts chunks that are actually in the batch. `add_chunked_req`
+        can *park* a request instead of prefilling it -- the hybrid-SWA branch
+        returns it without appending it to `can_run_list` when the SWA pool
+        cannot fit another page. A parked request produces no forward result,
+        so `process_batch_result_prefill` never runs the matching decrement;
+        the counter would ratchet up once per pass and a request stuck above
+        zero is treated as a middle chunk forever, never appending a token and
+        never finishing.
+
+        This mirrors the parked-chunk gate on the stash path in
+        `get_next_batch_to_run` (`extend_range.end > len(prefix_indices)`),
+        which detects the same condition from the request's own state.
+        """
+        for req in self.chunked_reqs:
+            if req in batch_reqs:
+                req.inflight_middle_chunks += 1
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
-        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
-        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
-        the top of the scheduling step stops the next chunk from launching; the
-        chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
-        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
-        ``process_batch_result_prefill`` via its chunked branch (the finished req
-        is excluded from streaming and its logprob offset is still accounted).
-        Mirrors ``handle_bootstrap_failure``.
+        ``abort_request`` only records the targets in ``_pending_chunked_abort_reqs``
+        (tearing them down mid-iteration is unsafe). Dropping a request from
+        ``chunked_reqs`` here at the top of the scheduling step stops its next
+        chunk from launching; the chunk already launched is drained when its
+        result is resolved. Under overlap the result lands a step later, so the
+        batch-result processors keep ``inflight_middle_chunks`` accounting intact
+        and skip the aborted chunk: ``process_batch_result_disagg_prefill`` via
+        its ``is_aborted`` drop, and ``process_batch_result_prefill`` via its
+        chunked branch (the finished req is excluded from streaming and its
+        logprob offset is still accounted). Mirrors ``handle_bootstrap_failure``.
         """
-        req = self._pending_chunked_abort_req
-        if req is None:
-            return
-        if self.chunked_req is not req:
-            # Already past chunked prefill; the running-batch abort path handles
-            # it. Drop the marker once the request is actually gone.
-            if req.finished() or not req.kv.holds_kv:
-                self._pending_chunked_abort_req = None
+        if not self._pending_chunked_abort_reqs:
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
-        req.to_finish = None
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        still_pending: List[Req] = []
+        for req in self._pending_chunked_abort_reqs:
+            if req not in self.chunked_reqs:
+                # Already past chunked prefill; the running-batch abort path
+                # handles it. Keep the marker until the request is really gone.
+                if not (req.finished() or not req.kv.holds_kv):
+                    still_pending.append(req)
+                continue
 
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+            prepare_abort(req, "Aborted")
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+            req.to_finish = None
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.clear_pending_chunk_send(req)
+                req.disagg_kv_sender.abort()
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                req.pending_bootstrap = False
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
+            self.chunked_reqs.remove(req)
+            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+            logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+        self._pending_chunked_abort_reqs = still_pending
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -3406,18 +3541,18 @@ class Scheduler(
                 else:
                     self.stash_chunked_request(req)
 
-        if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
+        for chunked_req in self.chunked_reqs:
+            # Move mid-prefill requests out of the batch so that we can merge
             # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
+            chunked_req_to_exclude.add(chunked_req)
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
             # hybrid-SWA early-return) leaves extend_range.end ==
             # len(prefix_indices), so there is nothing new to cache and
             # stashing would be a no-op.
-            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
-                self.stash_chunked_request(self.chunked_req)
+            if chunked_req.extend_range.end > len(chunked_req.prefix_indices):
+                self.stash_chunked_request(chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -3437,10 +3572,10 @@ class Scheduler(
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
-            if last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+            if last_batch.chunked_reqs:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked reqs.
+                # We need to discard them.
+                chunked_req_to_exclude.update(last_batch.chunked_reqs)
 
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
@@ -3519,7 +3654,7 @@ class Scheduler(
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
-            ret, chunked_req=self.chunked_req
+            ret, chunked_reqs=self.chunked_reqs
         )
 
         if ret:
@@ -3598,14 +3733,14 @@ class Scheduler(
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not self.chunked_reqs:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
-            and self.chunked_req is None
+            and not self.chunked_reqs
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(
@@ -3615,14 +3750,14 @@ class Scheduler(
         ):
             return None, running_batch
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # Ignore the check if any request is mid-prefill.
+        # In the non-PP case, when a request is mid-prefill, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
-            and self.chunked_req is None
+            and not self.chunked_reqs
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
@@ -3639,8 +3774,12 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(self.chunked_req.prefix_indices)
+        if self.chunked_reqs and self.enable_dynamic_chunking:
+            # Size the batch for the request that has made the least progress:
+            # the predictor maps history length to a chunk size that keeps step
+            # time even, and the shortest history is the most expensive chunk.
+            # (Dynamic chunking is PP-only, where concurrency stays at 1.)
+            history_len = min(len(r.prefix_indices) for r in self.chunked_reqs)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -3670,24 +3809,33 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            long_prefill_token_threshold=get_schedule().long_prefill_token_threshold,
+            max_concurrent_chunked_reqs=self.max_concurrent_chunked_reqs,
+            # 2026-09-21 自前追加: 上限を「譲る相手がいるときだけ」かけるための材料。
+            # この時点の chunked_reqs は前パスからの持ち越し集合そのもの。
+            num_carried_chunked_reqs=len(self.chunked_reqs),
         )
 
-        if self.chunked_req is not None:
-            chunked_req = self.chunked_req
+        # Re-admit the requests carried over from earlier passes, oldest first,
+        # so the longest-waiting prefill keeps priority on the budget. A
+        # request whose prefill finishes here drops out of the carried set.
+        carried_over, self.chunked_reqs = self.chunked_reqs, []
+        for _i, chunked_req in enumerate(carried_over):
             chunked_req.init_next_round_input()
             remaining_input_len = len(chunked_req.full_untruncated_fill_ids) - len(
                 chunked_req.prefix_indices
             )
             if remaining_input_len <= 0:
                 if self._promote_completed_chunked_req_to_running(chunked_req):
-                    self.chunked_req = None
-                else:
-                    # The final prefill result may still be pending in overlap mode.
-                    # Keep ownership so its stashed KV cannot become orphaned.
-                    self.chunked_req = chunked_req
-                    return None
-            else:
-                self.chunked_req = adder.add_chunked_req(chunked_req)
+                    continue
+                # The final prefill result may still be pending in overlap mode.
+                # Keep ownership so its stashed KV cannot become orphaned, and
+                # carry the not-yet-re-admitted remainder so it is not dropped.
+                self.chunked_reqs.extend(carried_over[_i:])
+                return None
+            still_chunked = adder.add_chunked_req(chunked_req)
+            if still_chunked is not None:
+                self.chunked_reqs.append(still_chunked)
 
         if self.enable_lora:
             running_loras = {
@@ -3705,6 +3853,8 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # 2026-09-22 自前追加: 容量で弾かれた要求の後ろを何本まで見るか。
+        _overtake_budget = 16 if envs.SGLANG_ADMIT_OVERTAKE.get() else 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3765,12 +3915,32 @@ class Scheduler(
                     req.swa_host_hit_length = held_swa_tokens
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                num_chunked_reqs=len(self.chunked_reqs) + len(adder.new_chunked_reqs),
                 truncation_align_size=self.truncation_align_size,
             )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
+
+            if res != AddReqResult.CONTINUE and envs.SGLANG_DEBUG_ADMIT.get():
+                # 受理されなかった理由と予算の内訳を出す診断ログ(既定OFF)。
+                # 「容量で弾かれた要求の後ろが検査されない」の特定に使った。
+                _need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                _allocatable = self.get_num_allocatable_reqs(
+                    len(running_batch.reqs), running_batch=running_batch
+                )
+                _chunked = len(self.chunked_reqs) + len(adder.new_chunked_reqs)
+                logger.info(
+                    f"[ADMIT] rid={req.rid[:8]} res={res} need={_need} "
+                    f"cur_rem={adder.cur_rem_tokens} "
+                    f"rem_total={int(adder.rem_total_tokens)} "
+                    f"rem_input={adder.rem_input_tokens} "
+                    f"rem_chunk={adder.rem_chunk_tokens} "
+                    f"rem_mamba={adder.rem_mamba_slots} "
+                    f"chunked={_chunked}/{self.max_concurrent_chunked_reqs} "
+                    f"can_run={len(adder.can_run_list)} "
+                    f"allocatable={_allocatable}"
+                )
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -3796,6 +3966,19 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                if res == AddReqResult.SKIP:
+                    # Only the mid-prefill capacity is full; later waiting
+                    # requests may still fit and must keep being considered.
+                    continue
+                if res == AddReqResult.NO_TOKEN and _overtake_budget > 0:
+                    # 2026-09-22 自前追加: この要求は「残りプール全部を確保できるか」
+                    # で落ちただけで、プールが尽きたわけではない(完走予約により
+                    # 先客の残量が引かれている)。ここで break すると、後ろに並んだ
+                    # 小さな要求が検査すらされず待たされる(実測 TTFT 109 秒)。
+                    # FCFS は崩すが、入れる要求だけを先に通す。
+                    _overtake_budget -= 1
+                    running_batch.batch_is_full = False
+                    continue
                 break
 
         if mamba_allocator is not None:
@@ -3812,13 +3995,19 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+        # Requests newly left mid-prefill by this pass join the carried set.
+        # The adder never hands back more than the capacity it was given, so
+        # the bound holds without a further check here.
+        assert (
+            len(self.chunked_reqs) + len(adder.new_chunked_reqs)
+            <= self.max_concurrent_chunked_reqs
+        ), (
+            f"chunked prefill over capacity: {len(self.chunked_reqs)} carried + "
+            f"{len(adder.new_chunked_reqs)} new > {self.max_concurrent_chunked_reqs}"
+        )
+        self.chunked_reqs.extend(adder.new_chunked_reqs)
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        self._count_inflight_chunk(can_run_set)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -3831,11 +4020,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_reqs=self.chunked_reqs,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        new_batch.contains_last_prefill_chunk = self._contains_last_prefill_chunk(
+            can_run_list
         )
 
         if self.enable_hierarchical_cache:
@@ -3856,11 +4045,7 @@ class Scheduler(
             running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
-                chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
-                    else 0
-                ),
+                chunk_deduct=(sum(r.extend_range.length for r in self.chunked_reqs)),
             ),
         )
 
@@ -3891,6 +4076,10 @@ class Scheduler(
                     self.future_map.stash_bonus_tokens(
                         running_batch.req_pool_indices, last_tokens
                     )
+                # Decode requests are merged in after the flag was computed
+                # above, and every one of them consumes the sampled token, so
+                # the batch is no longer pure middle chunks.
+                new_batch.contains_last_prefill_chunk = True
                 running_batch = ScheduleBatch(
                     reqs=[], batch_is_full=running_batch.batch_is_full
                 )
@@ -4354,7 +4543,7 @@ class Scheduler(
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
-            batch, batch_result, chunked_req=self.chunked_req
+            batch, batch_result, chunked_reqs=self.chunked_reqs
         )
 
     def _copy_auxiliary_output_to_cpu(
@@ -4630,7 +4819,7 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
+            and not self.chunked_reqs
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -5010,7 +5199,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
+            *self.chunked_reqs,
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -5031,9 +5220,10 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
+        for chunked_req in self.chunked_reqs:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+                if chunked_req not in self._pending_chunked_abort_reqs:
+                    self._pending_chunked_abort_reqs.append(chunked_req)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -5213,13 +5403,10 @@ class Scheduler(
         ):
             retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
 
-        if (
-            self.chunked_req is not None
-            and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs.append(self.chunked_req)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            for chunked_req in self.chunked_reqs:
+                if not chunked_req.finished() and chunked_req not in retract_reqs:
+                    retract_reqs.append(chunked_req)
 
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -5248,14 +5435,14 @@ class Scheduler(
             else:
                 self._add_request_to_queue(req)
         self.running_batch.batch_is_full = False
-        # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
+        # In disagg-PREFILL, keep live mid-chunk requests rather than retract them:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
         # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
         # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            self.chunked_req = None
+            self.chunked_reqs = []
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

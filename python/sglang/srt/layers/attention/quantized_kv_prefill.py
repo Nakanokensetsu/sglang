@@ -86,7 +86,7 @@ def _apply_oscar_rotation(
 
 def prepare_quantized_extend_qkv(
     kv_pool,
-    layer: "RadixAttention",
+    layer: RadixAttention,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -110,12 +110,8 @@ def prepare_quantized_extend_qkv(
         "fallback was intentionally not ported, see module docstring)"
     )
     R_k, R_v = kv_pool.get_oscar_rotation(layer.layer_id)
-    v_rotation_absorbed = bool(
-        getattr(layer, "oscar_v_rotation_absorbed", False)
-    )
-    kv_group_num = (
-        q.shape[-2] // k.shape[-2] if R_k.dim() == 3 and k.dim() >= 2 else 1
-    )
+    v_rotation_absorbed = bool(getattr(layer, "oscar_v_rotation_absorbed", False))
+    kv_group_num = q.shape[-2] // k.shape[-2] if R_k.dim() == 3 and k.dim() >= 2 else 1
     if not q_already_hadamard_transformed:
         q = _apply_oscar_rotation(q, R_k, kv_group_num)
     if not kv_already_hadamard_transformed:
@@ -126,7 +122,6 @@ def prepare_quantized_extend_qkv(
             v = _apply_oscar_rotation(v, R_v)
     need_v_inverse = True
     return q, k, v, need_v_inverse
-
 
 
 # --- PR #32129 移植 2026-09-19: mixed HP+int2 プールの prefix dequant ---
@@ -348,20 +343,20 @@ def dequantize_prefix_kv(
     raw_v = kv_pool.get_raw_value_buffer(layer_id)[prefix_indices]
     scales_k = kv_pool.get_key_scales_zeros(layer_id)[prefix_indices]
     scales_v = kv_pool.get_value_scales_zeros(layer_id)[prefix_indices]
-    assert kv_pool.dtype == "int2", (
-        f"Unsupported quantized KV dtype: {kv_pool.dtype}"
-    )
+    assert kv_pool.dtype == "int2", f"Unsupported quantized KV dtype: {kv_pool.dtype}"
     # 2026-09-14: out_k/out_v が渡されたら新規確保せずそこへ直接展開する
     return (
         dequantize_kv_int2_triton(raw_k, scales_k, l_head_dim, model_dtype, out=out_k),
-        dequantize_kv_int2_triton(raw_v, scales_v, l_v_head_dim, model_dtype, out=out_v),
+        dequantize_kv_int2_triton(
+            raw_v, scales_v, l_v_head_dim, model_dtype, out=out_v
+        ),
     )
 
 
 def apply_inverse_v_rotation(
     result: torch.Tensor,
     kv_pool,
-    layer: "RadixAttention",
+    layer: RadixAttention,
     need_v_inverse: bool,
 ) -> torch.Tensor:
     """Apply the inverse OSCAR V rotation (``result @ R_v.T``) on an
@@ -372,17 +367,15 @@ def apply_inverse_v_rotation(
     """
     if not need_v_inverse or kv_pool.dtype != "int2":
         return result
-    assert _pool_uses_oscar_rotation(kv_pool), (
-        "int2 KV pool has no OSCAR rotation loaded; see prepare_quantized_extend_qkv"
-    )
+    assert _pool_uses_oscar_rotation(
+        kv_pool
+    ), "int2 KV pool has no OSCAR rotation loaded; see prepare_quantized_extend_qkv"
     _, R_v = kv_pool.get_oscar_rotation(layer.layer_id)
     if R_v.dim() == 2:
         return (result.to(R_v.dtype) @ R_v.T).contiguous()
     q_heads = result.shape[-2]
     Rh = R_v.repeat_interleave(max(1, q_heads // R_v.shape[0]), dim=0)
-    return torch.einsum(
-        "thd,hed->the", result.to(R_v.dtype), Rh
-    ).contiguous()
+    return torch.einsum("thd,hed->the", result.to(R_v.dtype), Rh).contiguous()
 
 
 @triton.jit
@@ -417,6 +410,7 @@ def _cpu_int_list(values) -> Optional[list[int]]:
             return None
         return [int(v) for v in values.tolist()]
     return [int(v) for v in values]
+
 
 def build_prefix_indices_from_req_to_token(
     req_to_token: torch.Tensor,

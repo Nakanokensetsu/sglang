@@ -1449,9 +1449,7 @@ def _page_size_default(view: Any) -> dict:
     if _unified_mixed_kv_active(view):
         n_q = _unified_mixed_kv_page_size()
         if view.page_size is None:
-            logger.info(
-                "Unified mixed KV (int2) enabled: page_size=%s (= N_Q).", n_q
-            )
+            logger.info("Unified mixed KV (int2) enabled: page_size=%s (= N_Q).", n_q)
             return {"page_size": n_q}
         if view.page_size != n_q:
             from sglang.srt.environ import envs

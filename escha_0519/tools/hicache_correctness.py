@@ -23,9 +23,19 @@
 cached-from-host が実際に起きたかは、サーバ側のログ
 (`hicache` / `backup` 行)と合わせて見ること。
 """
-import json, os, random, sys, time, urllib.request
 
-MODEL = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.txt")).read().strip()
+import json
+import os
+import random
+import sys
+import time
+import urllib.request
+
+MODEL = (
+    open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.txt"))
+    .read()
+    .strip()
+)
 OUT = sys.argv[1]
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
 ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 20
@@ -44,15 +54,24 @@ for k in range(K):
 
 def ask(k):
     idx, _ = truth[k]
-    body = json.dumps({
-        "model": MODEL, "temperature": 0, "max_tokens": 16,
-        "chat_template_kwargs": {"enable_thinking": False},
-        "messages": [
-            {"role": "system", "content": prefixes[k]},
-            {"role": "user", "content": f"What is p{k}fact{idx}? Answer with the number only."},
-        ],
-    }).encode()
-    req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+    body = json.dumps(
+        {
+            "model": MODEL,
+            "temperature": 0,
+            "max_tokens": 16,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [
+                {"role": "system", "content": prefixes[k]},
+                {
+                    "role": "user",
+                    "content": f"What is p{k}fact{idx}? Answer with the number only.",
+                },
+            ],
+        }
+    ).encode()
+    req = urllib.request.Request(
+        URL, data=body, headers={"Content-Type": "application/json"}
+    )
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=1800) as r:
         d = json.load(r)
@@ -82,13 +101,19 @@ def main():
         r = ask(k)
         ok = correct(k, r)
         base.append(ok)
-        print(f"  phase1 chain{k}: {'OK ' if ok else 'NG '} got={r['text']!r} "
-              f"want={truth[k][1]} prompt={r['prompt']} cached={r['cached']} {r['secs']}s",
-              flush=True)
+        print(
+            f"  phase1 chain{k}: {'OK ' if ok else 'NG '} got={r['text']!r} "
+            f"want={truth[k][1]} prompt={r['prompt']} cached={r['cached']} {r['secs']}s",
+            flush=True,
+        )
     if not all(base):
-        print("\n中止: デバイス側だけでも正解しない。このテストには判別力が無い。"
-              "\nNFACT を下げるか、質問位置を変えること。")
-        json.dump({"aborted": "phase1 failed", "phase1": base}, open(OUT, "w"), indent=1)
+        print(
+            "\n中止: デバイス側だけでも正解しない。このテストには判別力が無い。"
+            "\nNFACT を下げるか、質問位置を変えること。"
+        )
+        json.dump(
+            {"aborted": "phase1 failed", "phase1": base}, open(OUT, "w"), indent=1
+        )
         return 2
 
     # --- フェーズ2: ホストからの復元 ---
@@ -103,24 +128,41 @@ def main():
         ok = correct(target, r)
         if not ok:
             bad += 1
-        rows.append({"round": rnd_i, "chain": target, "ok": ok, "got": r["text"],
-                     "want": truth[target][1], "prompt": r["prompt"],
-                     "cached": r["cached"], "secs": r["secs"]})
-        print(f"  round{rnd_i:3d} chain{target}: {'OK ' if ok else 'NG '} "
-              f"got={r['text']!r} want={truth[target][1]} "
-              f"cached={r['cached']}/{r['prompt']} {r['secs']}s", flush=True)
+        rows.append(
+            {
+                "round": rnd_i,
+                "chain": target,
+                "ok": ok,
+                "got": r["text"],
+                "want": truth[target][1],
+                "prompt": r["prompt"],
+                "cached": r["cached"],
+                "secs": r["secs"],
+            }
+        )
+        print(
+            f"  round{rnd_i:3d} chain{target}: {'OK ' if ok else 'NG '} "
+            f"got={r['text']!r} want={truth[target][1]} "
+            f"cached={r['cached']}/{r['prompt']} {r['secs']}s",
+            flush=True,
+        )
 
     hit = sum(x["cached"] for x in rows) / max(sum(x["prompt"] for x in rows), 1)
     print(f"\n正答 {ROUNDS - bad}/{ROUNDS}  平均キャッシュヒット {100*hit:.1f}%")
     if bad:
         print("=> 静かに壊れている。ホスト層の復元が内容を変えた。")
     elif hit < 0.5:
-        print("=> 全問正解だが、ヒット率が低い。追い出しが起きておらず"
-              "ホスト経路を通っていない疑い。プールをもっと小さくして再測すること。")
+        print(
+            "=> 全問正解だが、ヒット率が低い。追い出しが起きておらず"
+            "ホスト経路を通っていない疑い。プールをもっと小さくして再測すること。"
+        )
     else:
         print("=> ホストから復元した prefix で内容が保たれている。")
-    json.dump({"phase1": base, "rounds": rows, "wrong": bad,
-               "hit": round(hit, 4)}, open(OUT, "w"), indent=1)
+    json.dump(
+        {"phase1": base, "rounds": rows, "wrong": bad, "hit": round(hit, 4)},
+        open(OUT, "w"),
+        indent=1,
+    )
     return 1 if bad else 0
 
 

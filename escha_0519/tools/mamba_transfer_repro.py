@@ -9,6 +9,7 @@
   PYTHONPATH=/path/to/sglang/python CUDA_LAUNCH_BLOCKING=1 \
     python3 tools/mamba_transfer_repro.py [host_slots]
 """
+
 import sys
 
 import torch
@@ -29,16 +30,25 @@ HOST_SLOTS = int(sys.argv[1]) if len(sys.argv) > 1 else 65
 
 def main():
     dev = "cuda:0"
-    item_size = STATE[0] * STATE[1] * STATE[2] * torch.empty(0, dtype=DTYPE).element_size()
-    print(f"num_layers={NUM_LAYERS} item_size={item_size}B "
-          f"device={NUM_LAYERS}x{DEV_SLOTS}x{STATE} host_slots={HOST_SLOTS}")
+    item_size = (
+        STATE[0] * STATE[1] * STATE[2] * torch.empty(0, dtype=DTYPE).element_size()
+    )
+    print(
+        f"num_layers={NUM_LAYERS} item_size={item_size}B "
+        f"device={NUM_LAYERS}x{DEV_SLOTS}x{STATE} host_slots={HOST_SLOTS}"
+    )
     print(f"device arena = {NUM_LAYERS * DEV_SLOTS * item_size / 2**30:.2f} GiB")
     print(f"host  arena = {HOST_SLOTS * NUM_LAYERS * item_size / 2**30:.2f} GiB")
 
-    src = torch.arange(
-        NUM_LAYERS * DEV_SLOTS * STATE[0] * STATE[1] * STATE[2],
-        dtype=torch.int32, device=dev,
-    ).to(DTYPE).view(NUM_LAYERS, DEV_SLOTS, *STATE)
+    src = (
+        torch.arange(
+            NUM_LAYERS * DEV_SLOTS * STATE[0] * STATE[1] * STATE[2],
+            dtype=torch.int32,
+            device=dev,
+        )
+        .to(DTYPE)
+        .view(NUM_LAYERS, DEV_SLOTS, *STATE)
+    )
     src_ptrs = torch.tensor(
         [src[i].data_ptr() for i in range(NUM_LAYERS)], dtype=torch.uint64, device=dev
     )
@@ -47,21 +57,28 @@ def main():
     alloc = ALLOC_MEMORY_FUNCS["cuda"]
     dst = alloc(
         (HOST_SLOTS, NUM_LAYERS, 1) + STATE,
-        dtype=DTYPE, device="cpu", pin_memory=True,
+        dtype=DTYPE,
+        device="cpu",
+        pin_memory=True,
         allocator=get_allocator_from_storage("default"),
         registration_granularity_bytes=NUM_LAYERS * item_size,
     )
-    print(f"host pinned={dst.is_pinned()} bytes={dst.numel()*dst.element_size()} "
-          f"registered={hasattr(dst, '_sglang_cuda_host_registered_ranges')}")
+    print(
+        f"host pinned={dst.is_pinned()} bytes={dst.numel()*dst.element_size()} "
+        f"registered={hasattr(dst, '_sglang_cuda_host_registered_ranges')}"
+    )
 
     src_idx = torch.tensor([6], dtype=torch.int64, device=dev)
     dst_idx = torch.tensor([0], dtype=torch.int64, device=dev)
 
     print("launching...", flush=True)
     transfer_kv_mamba_lf_pf(
-        src_ptrs=src_ptrs, dst=dst,
-        src_indices=src_idx, dst_indices=dst_idx,
-        item_size=item_size, dst_layout_dim=item_size * NUM_LAYERS,
+        src_ptrs=src_ptrs,
+        dst=dst,
+        src_indices=src_idx,
+        dst_indices=dst_idx,
+        item_size=item_size,
+        dst_layout_dim=item_size * NUM_LAYERS,
         num_layers=NUM_LAYERS,
     )
     torch.cuda.synchronize()
