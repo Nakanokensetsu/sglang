@@ -677,6 +677,7 @@ class Scheduler(
 
         # Raise the mid-prefill capacity when the per-request prefill ceiling
         # is enabled (needs dllm_config and disaggregation_mode to be set).
+        self.init_prefill_concurrency_threshold()
         self.init_chunked_prefill_concurrency()
 
         # Init overlap schedule
@@ -1305,20 +1306,13 @@ class Scheduler(
         if is_extend:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
-    def init_chunked_prefill_concurrency(self):
-        """Raise the mid-prefill capacity when the per-request ceiling is on.
+    def init_prefill_concurrency_threshold(self):
+        """Derive the per-request prefill ceiling F from a session count N.
 
-        With long_prefill_token_threshold F > 0, one pass hands at most F
-        prompt tokens to any single request, so up to
-        chunked_prefill_size // F requests can be mid-prefill at once
-        instead of one long prompt monopolizing the prefill budget.
-
-        Concurrency stays at 1 where the single-slot invariant is still
-        load-bearing: disagg prefill (the mixin shares this state and its KV
-        transfer bookkeeping assumes one in-flight chunk), PP > 1 (microbatch
-        accounting), and dLLM (the staging queue owns its mid-prefill
-        requests). Speculative decoding needs no gate: DSpark/EAGLE track
-        per-request state and never read the slot count.
+        Kept out of `init_chunked_prefill_concurrency` on purpose: that one is
+        upstream #34623's, and leaving it untouched keeps future merges of it
+        conflict-free. This runs first because it writes the threshold that one
+        then reads.
         """
         # 2026-09-22 自前追加: 同時に面倒を見るセッション数 N を入口にする。
         # 予算 chunked_prefill_size を N 等分したものが1本あたりの取り分 F になり、
@@ -1351,6 +1345,21 @@ class Scheduler(
                 f"{_derived} (chunked_prefill_size={self.chunked_prefill_size})."
             )
 
+    def init_chunked_prefill_concurrency(self):
+        """Raise the mid-prefill capacity when the per-request ceiling is on.
+
+        With long_prefill_token_threshold F > 0, one pass hands at most F
+        prompt tokens to any single request, so up to
+        chunked_prefill_size // F requests can be mid-prefill at once
+        instead of one long prompt monopolizing the prefill budget.
+
+        Concurrency stays at 1 where the single-slot invariant is still
+        load-bearing: disagg prefill (the mixin shares this state and its KV
+        transfer bookkeeping assumes one in-flight chunk), PP > 1 (microbatch
+        accounting), and dLLM (the staging queue owns its mid-prefill
+        requests). Speculative decoding needs no gate: DSpark/EAGLE track
+        per-request state and never read the slot count.
+        """
         threshold = get_schedule().long_prefill_token_threshold
         if (
             threshold <= 0
