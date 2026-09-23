@@ -19,6 +19,7 @@ frozen code on the fly + the exact clamped-interleaved-SwiGLU routing). The
 GEMM backend is swappable (pytorch decode-loop first for correctness; a
 future user-authored grouped-GEMM kernel can replace ``apply`` later).
 """
+
 from __future__ import annotations
 
 import logging
@@ -36,8 +37,15 @@ from sglang.srt.layers.quantization.base_config import (
 logger = logging.getLogger(__name__)
 
 _PROJS = ("gate_up_proj", "down_proj")
-_SUFFIXES = ("escha_code", "escha_rin", "escha_rout", "escha_s_in", "escha_s_out",
-             "escha_bias", "escha_config")
+_SUFFIXES = (
+    "escha_code",
+    "escha_rin",
+    "escha_rout",
+    "escha_s_in",
+    "escha_s_out",
+    "escha_bias",
+    "escha_config",
+)
 
 
 def _round_up(n: int, m: int = 128) -> int:
@@ -47,10 +55,19 @@ def _round_up(n: int, m: int = 128) -> int:
 class DIEschaMoEConfig(QuantizationConfig):
     """Config for eschamoe — reads the quantization_config block our exporter writes."""
 
-    def __init__(self, codebook: str, codebook_id: int, bits: float, num_experts: int,
-                 fold_scales: bool, int8_embedding: bool, ignore: List[str],
-                 layer_meta: Dict[str, Any], full_config: Dict[str, Any],
-                 experts_kind: str = "gptoss") -> None:
+    def __init__(
+        self,
+        codebook: str,
+        codebook_id: int,
+        bits: float,
+        num_experts: int,
+        fold_scales: bool,
+        int8_embedding: bool,
+        ignore: List[str],
+        layer_meta: Dict[str, Any],
+        full_config: Dict[str, Any],
+        experts_kind: str = "gptoss",
+    ) -> None:
         super().__init__()
         self.codebook = codebook
         self.codebook_id = codebook_id
@@ -102,9 +119,12 @@ class DIEschaMoEConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional[QuantizeMethodBase]:
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
         # Experts -> our code MoE method.
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
         if isinstance(layer, FusedMoE):
             return DIEschaMoEMethod(self)
         # FP16-kept linears (attn/router/lm_head): UnquantizedLinearMethod (NOT None —
@@ -112,6 +132,7 @@ class DIEschaMoEConfig(QuantizationConfig):
         # except the experts, so any LinearBase is unquantized.
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()
         return None
@@ -123,7 +144,7 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: DIEschaMoEConfig) -> None:
         self.quant_config = quant_config
-        self.K = max(1, int(round(quant_config.bits)))   # uniform-model default
+        self.K = max(1, int(round(quant_config.bits)))  # uniform-model default
         # Mixed-bit models (e.g. K=2 gate_up + K=3 down_proj) record per-projection K
         # in layer_meta. create_weights allocates ONE placeholder K per projection, so
         # size it at the SMALLEST per-proj K present and let the load path GROW any
@@ -133,25 +154,42 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
         # cards (friction 2026-07-23 #1). Decode stays per-proj-correct regardless: K
         # is read from each loaded code's shape in process_weights_after_loading.
         _lm = getattr(quant_config, "layer_meta", None) or {}
-        _ks = [m["K"] for m in _lm.values() if isinstance(m, dict) and isinstance(m.get("K"), int)]
+        _ks = [
+            m["K"]
+            for m in _lm.values()
+            if isinstance(m, dict) and isinstance(m.get("K"), int)
+        ]
         if _ks:
             self.K = max(1, min(_ks))
         self.codebook = quant_config.codebook
         self.experts_kind = getattr(quant_config, "experts_kind", "gptoss")
-        self.packed = None                               # built in process_weights_after_loading
+        self.packed = None  # built in process_weights_after_loading
 
     # ---- shapes (uniform across experts/layers for gpt-oss) ----
     def _dims(self, hidden: int, inter: int):
         return {
-            "gate_up_proj": dict(in_f=hidden, out_f=2 * inter,
-                                 in_p=_round_up(hidden), out_p=_round_up(2 * inter)),
-            "down_proj": dict(in_f=inter, out_f=hidden,
-                              in_p=_round_up(inter), out_p=_round_up(hidden)),
+            "gate_up_proj": dict(
+                in_f=hidden,
+                out_f=2 * inter,
+                in_p=_round_up(hidden),
+                out_p=_round_up(2 * inter),
+            ),
+            "down_proj": dict(
+                in_f=inter, out_f=hidden, in_p=_round_up(inter), out_p=_round_up(hidden)
+            ),
         }
 
-    def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition,
-                       params_dtype, **extra_weight_attrs):
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
         from sglang.srt.utils import set_weight_attrs
+
         E = num_experts
         K = self.K
         dims = self._dims(hidden_size, intermediate_size_per_partition)
@@ -171,7 +209,10 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
         for proj in _PROJS:
             d = dims[proj]
             in_p, out_p, in_f, out_f = d["in_p"], d["out_p"], d["in_f"], d["out_f"]
-            reg(f"{proj}_escha_code", torch.zeros(E, in_p // 16, out_p // 16, 16 * K, dtype=torch.int16))
+            reg(
+                f"{proj}_escha_code",
+                torch.zeros(E, in_p // 16, out_p // 16, 16 * K, dtype=torch.int16),
+            )
             reg(f"{proj}_escha_rin", torch.zeros(E, in_p, dtype=torch.float16))
             reg(f"{proj}_escha_rout", torch.zeros(E, out_p, dtype=torch.float16))
             reg(f"{proj}_escha_s_in", torch.ones(E, in_f, dtype=torch.float32))
@@ -182,8 +223,8 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer) -> None:
         """Build escha's PackedGptOssExperts from the loaded stacked params, then
         load the per-expert s_in/s_out (ones when --fold-scales)."""
-        from transformers import AutoConfig  # noqa: F401 (not needed; build cfg shim)
         from escha.gptoss_experts import PackedGptOssExperts
+        from transformers import AutoConfig  # noqa: F401 (not needed; build cfg shim)
 
         E = layer._diescha_E
         H, I = layer._diescha_hidden, layer._diescha_inter
@@ -201,9 +242,16 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
             _Kp = int(tr.shape[-1] // 16)
             for e in range(E):
                 codes[f"{proj}_{e}"] = {
-                    "code": tr[e], "rin": rin[e], "rout": rout[e], "bias": bias[e],
-                    "K": _Kp, "codebook": self.codebook,
-                    "in_f": d["in_f"], "out_f": d["out_f"], "in_p": d["in_p"], "out_p": d["out_p"],
+                    "code": tr[e],
+                    "rin": rin[e],
+                    "rout": rout[e],
+                    "bias": bias[e],
+                    "K": _Kp,
+                    "codebook": self.codebook,
+                    "in_f": d["in_f"],
+                    "out_f": d["out_f"],
+                    "in_p": d["in_p"],
+                    "out_p": d["out_p"],
                 }
 
         dev = getattr(layer, "gate_up_proj_escha_code").device
@@ -215,20 +263,29 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
                 num_experts = E
                 hidden_size = H
                 moe_intermediate_size = I
-            packed = PackedQwen35MoeExperts(codes, _Cfg(), bias_correction=False).to(dev)
+
+            packed = PackedQwen35MoeExperts(codes, _Cfg(), bias_correction=False).to(
+                dev
+            )
         else:
+
             class _Cfg:  # PackedGptOssExperts reads these attrs
                 num_local_experts = E
                 hidden_size = H
                 intermediate_size = I
                 alpha = 1.702
                 limit = 7.0
+
             packed = PackedGptOssExperts(codes, _Cfg(), bias_correction=False).to(dev)
         # load s_in/s_out (ones when folded) into the per-expert scale params
         for proj in _PROJS:
             s_in = getattr(layer, f"{proj}_escha_s_in")
             s_out = getattr(layer, f"{proj}_escha_s_out")
-            D = packed.gate_up_experts if proj == "gate_up_proj" else packed.down_experts
+            D = (
+                packed.gate_up_experts
+                if proj == "gate_up_proj"
+                else packed.down_experts
+            )
             for name, m in D.items():
                 e = int(name.rsplit("_", 1)[1])
                 with torch.no_grad():
@@ -252,23 +309,36 @@ class DIEschaMoEMethod(FusedMoEMethodBase):
         # free the raw stacked params (PackedGptOssExperts holds its own views/copies)
         torch.cuda.empty_cache()
         import os as _os
+
         if _os.environ.get("ESCHA_MEMDIAG"):
-            _raw = [n for n in ("gate_up_proj_escha_code", "down_proj_escha_code")
-                    if hasattr(layer, n)]
-            logger.info("eschamoe MEMDIAG: alloc=%.2fGB reserved=%.2fGB raw_code_still_on_layer=%s",
-                        torch.cuda.memory_allocated() / 1e9, torch.cuda.memory_reserved() / 1e9, _raw)
-        logger.info("eschamoe: built %s (experts_kind=%s) for a FusedMoE (%d experts)",
-                    type(packed).__name__, getattr(self, "experts_kind", "gptoss"), E)
+            _raw = [
+                n
+                for n in ("gate_up_proj_escha_code", "down_proj_escha_code")
+                if hasattr(layer, n)
+            ]
+            logger.info(
+                "eschamoe MEMDIAG: alloc=%.2fGB reserved=%.2fGB raw_code_still_on_layer=%s",
+                torch.cuda.memory_allocated() / 1e9,
+                torch.cuda.memory_reserved() / 1e9,
+                _raw,
+            )
+        logger.info(
+            "eschamoe: built %s (experts_kind=%s) for a FusedMoE (%d experts)",
+            type(packed).__name__,
+            getattr(self, "experts_kind", "gptoss"),
+            E,
+        )
 
     def create_moe_runner(self, layer, moe_runner_config) -> None:
         self.moe_runner_config = moe_runner_config
 
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        x = dispatch_output.hidden_states                  # [N, H]
+
+        x = dispatch_output.hidden_states  # [N, H]
         topk = dispatch_output.topk_output
-        topk_ids = topk.topk_ids.to(torch.long)            # [N, top_k]
-        topk_w = topk.topk_weights.to(x.dtype)             # [N, top_k]
+        topk_ids = topk.topk_ids.to(torch.long)  # [N, top_k]
+        topk_w = topk.topk_weights.to(x.dtype)  # [N, top_k]
         packed = self.packed if self.packed is not None else layer._diescha_packed
-        out = packed(x, topk_ids, topk_w)                  # routed + SwiGLU + bias + weight + sum
+        out = packed(x, topk_ids, topk_w)  # routed + SwiGLU + bias + weight + sum
         return StandardCombineInput(hidden_states=out.to(x.dtype))

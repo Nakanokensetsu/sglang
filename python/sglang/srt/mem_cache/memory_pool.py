@@ -49,6 +49,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+
 # PR #32129 のデータフリー Hadamard 書き込み経路は移植していないので
 # (当フォークは OSCAR 学習回転 + clip が必須)、その専用 import も持たない。
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -1933,7 +1934,6 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
-
 # ===== 2026-09-18 自前移植: OSCAR int2 量子化KV の回転設定 (本番 0.5.15 より) =====
 from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
     quantized_set_kv_int2_pretransformed_clip_triton,
@@ -2010,9 +2010,7 @@ def load_oscar_rotations(
     """
     state = torch.load(path, map_location="cpu")
     if "layers" not in state:
-        raise ValueError(
-            f"Oscar rotation checkpoint at {path} missing 'layers' key"
-        )
+        raise ValueError(f"Oscar rotation checkpoint at {path} missing 'layers' key")
     layers = state["layers"]
 
     if layer_ids is not None:
@@ -2184,8 +2182,12 @@ class MHATokenToKVPool(KVCache):
         if dtype == "int2":
             try:
                 import torch as _t
-                _ck = _t.load(envs.SGLANG_OSCAR_K_ROTATION_PATH.get(),
-                              map_location="cpu", weights_only=False)
+
+                _ck = _t.load(
+                    envs.SGLANG_OSCAR_K_ROTATION_PATH.get(),
+                    map_location="cpu",
+                    weights_only=False,
+                )
                 _ly = _ck.get("layers") if isinstance(_ck, dict) else None
                 if isinstance(_ly, dict):
                     oscar_rotation_layer_ids = sorted(int(k) for k in _ly.keys())
@@ -2594,19 +2596,33 @@ class MHATokenToKVPool(KVCache):
             ):
                 # 2026-09-18 自前移植: OSCAR int2。2bit を head_dim 軸に4個/バイトで詰める。
                 if self.dtype == "int2":
-                    assert self.head_dim % 4 == 0, f"head_dim {self.head_dim} must be %4 for int2"
-                    assert self.v_head_dim % 4 == 0, f"v_head_dim {self.v_head_dim} must be %4 for int2"
+                    assert (
+                        self.head_dim % 4 == 0
+                    ), f"head_dim {self.head_dim} must be %4 for int2"
+                    assert (
+                        self.v_head_dim % 4 == 0
+                    ), f"v_head_dim {self.v_head_dim} must be %4 for int2"
                     self.k_buffer = [
                         torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.head_dim // 4),
-                            dtype=self.store_dtype, device=self.device,
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.head_dim // 4,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
                         )
                         for _ in range(self.layer_num)
                     ]
                     self.v_buffer = [
                         torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.v_head_dim // 4),
-                            dtype=self.store_dtype, device=self.device,
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.v_head_dim // 4,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
                         )
                         for _ in range(self.layer_num)
                     ]

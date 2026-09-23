@@ -14,9 +14,6 @@ import torch
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
-from sglang.srt.mem_cache.unified_kv_pool import (
-    resolve_mixed_kv_pool_from_allocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -85,6 +82,9 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedLRUList,
     UnifiedTreeCore,
     UnifiedTreeNode,
+)
+from sglang.srt.mem_cache.unified_kv_pool import (
+    resolve_mixed_kv_pool_from_allocator,
 )
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
@@ -392,9 +392,7 @@ class UnifiedRadixCache(BasePrefixCache):
             idx = torch.cat(parts) if len(parts) > 1 else parts[0]
         else:
             idx = torch.empty((0,), dtype=torch.int64, device=row.device)
-        self.token_to_kv_pool_allocator.free(
-            self._with_mixed_quant_slack(req, idx)
-        )
+        self.token_to_kv_pool_allocator.free(self._with_mixed_quant_slack(req, idx))
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -1071,10 +1069,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 # unfinished 側と同じく insert を飛ばす。
                 global _ZERO_LEN_INSERT_SKIPPED
                 _ZERO_LEN_INSERT_SKIPPED += 1
-                if (
-                    _ZERO_LEN_INSERT_SKIPPED == 1
-                    or _ZERO_LEN_INSERT_SKIPPED % 100 == 0
-                ):
+                if _ZERO_LEN_INSERT_SKIPPED == 1 or _ZERO_LEN_INSERT_SKIPPED % 100 == 0:
                     logger.info(
                         "skipped a zero-length cache_finished_req insert "
                         "(no valid mamba checkpoint); total %d",
@@ -1192,7 +1187,10 @@ class UnifiedRadixCache(BasePrefixCache):
             if mamba_cache_len is not None and mamba_cache_len > publish_cap:
                 global _MIXED_KV_PUBLISH_SKIPPED
                 _MIXED_KV_PUBLISH_SKIPPED += 1
-                if _MIXED_KV_PUBLISH_SKIPPED == 1 or _MIXED_KV_PUBLISH_SKIPPED % 100 == 0:
+                if (
+                    _MIXED_KV_PUBLISH_SKIPPED == 1
+                    or _MIXED_KV_PUBLISH_SKIPPED % 100 == 0
+                ):
                     logger.info(
                         "mixed-KV: mamba checkpoint at %d is inside the HP-recent "
                         "band (publish cap %d); skipping this publish (total %d)",

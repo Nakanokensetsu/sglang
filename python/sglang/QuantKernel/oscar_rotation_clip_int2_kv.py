@@ -18,8 +18,8 @@ constexprs (``-1`` disables clip).
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
 import warnings
+from typing import Dict, Tuple
 
 import torch
 import triton
@@ -30,8 +30,6 @@ from sglang.srt.mem_cache.kv_quant_kernels import (
     _is_power_of_two,
     _launch_quantize_int2,
 )
-
-
 
 # ---------------------------------------------------------------------------
 # Fused threshold + clip + int2 pack kernels
@@ -141,18 +139,26 @@ def _pretransformed_int2_set_kv_clip_single_kernel(
         LM_M0: tl.constexpr = -0.9810652732849121
         LM_M1: tl.constexpr = 0.0
         LM_M2: tl.constexpr = 0.9810652732849121
-        q0 = ((z0 >= LM_M0).to(tl.uint8)
-              + (z0 >= LM_M1).to(tl.uint8)
-              + (z0 >= LM_M2).to(tl.uint8))
-        q1 = ((z1 >= LM_M0).to(tl.uint8)
-              + (z1 >= LM_M1).to(tl.uint8)
-              + (z1 >= LM_M2).to(tl.uint8))
-        q2 = ((z2 >= LM_M0).to(tl.uint8)
-              + (z2 >= LM_M1).to(tl.uint8)
-              + (z2 >= LM_M2).to(tl.uint8))
-        q3 = ((z3 >= LM_M0).to(tl.uint8)
-              + (z3 >= LM_M1).to(tl.uint8)
-              + (z3 >= LM_M2).to(tl.uint8))
+        q0 = (
+            (z0 >= LM_M0).to(tl.uint8)
+            + (z0 >= LM_M1).to(tl.uint8)
+            + (z0 >= LM_M2).to(tl.uint8)
+        )
+        q1 = (
+            (z1 >= LM_M0).to(tl.uint8)
+            + (z1 >= LM_M1).to(tl.uint8)
+            + (z1 >= LM_M2).to(tl.uint8)
+        )
+        q2 = (
+            (z2 >= LM_M0).to(tl.uint8)
+            + (z2 >= LM_M1).to(tl.uint8)
+            + (z2 >= LM_M2).to(tl.uint8)
+        )
+        q3 = (
+            (z3 >= LM_M0).to(tl.uint8)
+            + (z3 >= LM_M1).to(tl.uint8)
+            + (z3 >= LM_M2).to(tl.uint8)
+        )
 
         LM_C0_EFF: tl.constexpr = -1.5095585584640503
         LM_C3_EFF: tl.constexpr = 1.5095585584640503
@@ -257,7 +263,9 @@ def _pretransformed_int2_set_kv_clip_grouped_kernel(
         input_ptr + base,
         mask=tok_mask[:, None],
         other=0.0,
-    ).to(tl.float32)  # [BLOCK_TOK, HEAD_DIM]
+    ).to(
+        tl.float32
+    )  # [BLOCK_TOK, HEAD_DIM]
 
     if CLIP_INDEX >= 0:
         abs_acc = tl.abs(acc)
@@ -279,9 +287,9 @@ def _pretransformed_int2_set_kv_clip_grouped_kernel(
     # scale/zero without a separate gather. Then reshape back to
     # ``[BLOCK_TOK, HEAD_DIM]`` and quartered-split with the same
     # reshape + permute + split idiom as the single-scale kernel.
-    quant = (
-        tl.math.div_rn(grouped, scale[:, :, None]) + zero[:, :, None] + 0.5
-    ).to(tl.uint8)  # [BLOCK_TOK, NUM_GROUPS, GROUP_SIZE]
+    quant = (tl.math.div_rn(grouped, scale[:, :, None]) + zero[:, :, None] + 0.5).to(
+        tl.uint8
+    )  # [BLOCK_TOK, NUM_GROUPS, GROUP_SIZE]
     quant_flat = tl.reshape(quant, (BLOCK_TOK, HEAD_DIM))
     quant_r = tl.reshape(quant_flat, (BLOCK_TOK, 4, BLOCK_QUARTER))
     quant_p = tl.permute(quant_r, (0, 2, 1))  # [BLOCK_TOK, BLOCK_QUARTER, 4]
@@ -301,13 +309,9 @@ def _pretransformed_int2_set_kv_clip_grouped_kernel(
     tl.store(cache_ptr + cache_offset, packed, mask=active[:, None])
 
     group_ids = tl.arange(0, NUM_GROUPS)
-    sz_offset_base = (
-        cache_loc[:, None] * sz_stride_loc + head_idx * sz_stride_head
-    )
+    sz_offset_base = cache_loc[:, None] * sz_stride_loc + head_idx * sz_stride_head
     tl.store(
-        scales_zeros_ptr
-        + sz_offset_base
-        + (group_ids[None, :] * 2) * sz_stride_dim,
+        scales_zeros_ptr + sz_offset_base + (group_ids[None, :] * 2) * sz_stride_dim,
         scale,
         mask=active[:, None],
     )
@@ -401,13 +405,11 @@ def _launch_single_clip_int2(
     num_tokens, num_heads, head_dim = data.shape
     if num_tokens == 0:
         return
-    assert _is_power_of_two(head_dim), (
-        f"clip int2 kernel requires power-of-two head_dim, got {head_dim}"
-    )
+    assert _is_power_of_two(
+        head_dim
+    ), f"clip int2 kernel requires power-of-two head_dim, got {head_dim}"
     elements_per_thread = _vectorized_elems_per_thread(data.dtype)
-    block_tok, num_warps = _pick_block_tok_and_num_warps(
-        head_dim, elements_per_thread
-    )
+    block_tok, num_warps = _pick_block_tok_and_num_warps(head_dim, elements_per_thread)
     grid = (triton.cdiv(num_tokens, block_tok), num_heads)
     _pretransformed_int2_set_kv_clip_single_kernel[grid](
         data,
@@ -453,13 +455,11 @@ def _launch_grouped_clip_int2(
     block_quarter = triton.next_power_of_2(head_dim // 4)
     elements_per_thread = _vectorized_elems_per_thread(data.dtype)
 
-    block_tok, num_warps = _pick_block_tok_and_num_warps(
-        head_dim, elements_per_thread
-    )
+    block_tok, num_warps = _pick_block_tok_and_num_warps(head_dim, elements_per_thread)
 
-    assert _is_power_of_two(head_dim), (
-        f"clip int2 kernel requires power-of-two head_dim, got {head_dim}"
-    )
+    assert _is_power_of_two(
+        head_dim
+    ), f"clip int2 kernel requires power-of-two head_dim, got {head_dim}"
     assert _is_power_of_two(num_groups) and head_dim % num_groups == 0
 
     grid = (triton.cdiv(num_tokens, block_tok), num_heads)
@@ -528,12 +528,8 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
     if num_tokens == 0:
         return
 
-    k_grouped_ok = _can_use_grouped_clip_kernel(
-        k_head_dim, k_scales_zeros_buffer
-    )
-    v_grouped_ok = _can_use_grouped_clip_kernel(
-        v_head_dim, v_scales_zeros_buffer
-    )
+    k_grouped_ok = _can_use_grouped_clip_kernel(k_head_dim, k_scales_zeros_buffer)
+    v_grouped_ok = _can_use_grouped_clip_kernel(v_head_dim, v_scales_zeros_buffer)
     if not (k_grouped_ok and v_grouped_ok):
         raise NotImplementedError(
             f"pretransformed_clip int2 kernel requires power-of-two group configs "
@@ -563,9 +559,7 @@ def quantized_set_kv_int2_pretransformed_clip_triton(
                     f"dimension {head_dim}; using uniform INT2 for this tensor.",
                     stacklevel=2,
                 )
-            _launch_quantize_int2(
-                data, loc, buffer, scales_zeros, hp_global_offset
-            )
+            _launch_quantize_int2(data, loc, buffer, scales_zeros, hp_global_offset)
         elif _get_num_scale_groups(scales_zeros) == 1:
             _launch_single_clip_int2(
                 data,
@@ -710,9 +704,7 @@ def _kv_oscar_rotate_k_clip_single_kernel(
             thr_hi = tl.max(abs_rows, axis=1)
             for _ in tl.static_range(BSEARCH_ITERS):
                 thr_mid = (thr_lo + thr_hi) * 0.5
-                cnt_above = tl.sum(
-                    (abs_rows > thr_mid[:, None]).to(tl.int32), axis=1
-                )
+                cnt_above = tl.sum((abs_rows > thr_mid[:, None]).to(tl.int32), axis=1)
                 too_many = cnt_above > target_above
                 thr_lo = tl.where(too_many, thr_mid, thr_lo)
                 thr_hi = tl.where(too_many, thr_hi, thr_mid)
@@ -775,9 +767,7 @@ def _kv_oscar_rotate_k_clip_single_kernel(
             thr_hi = tl.max(abs_rows, axis=1)
             for _ in tl.static_range(BSEARCH_ITERS):
                 thr_mid = (thr_lo + thr_hi) * 0.5
-                cnt_above = tl.sum(
-                    (abs_rows > thr_mid[:, None]).to(tl.int32), axis=1
-                )
+                cnt_above = tl.sum((abs_rows > thr_mid[:, None]).to(tl.int32), axis=1)
                 too_many = cnt_above > target_above
                 thr_lo = tl.where(too_many, thr_mid, thr_lo)
                 thr_hi = tl.where(too_many, thr_hi, thr_mid)
@@ -827,9 +817,7 @@ def _pick_block_tok_and_num_warps_for_dot(
     """Same target as :func:`_pick_block_tok_and_num_warps` but enforces
     ``BLOCK_TOK >= 16`` so ``tl.dot`` has a valid M dimension.
     """
-    block_tok, num_warps = _pick_block_tok_and_num_warps(
-        head_dim, elements_per_thread
-    )
+    block_tok, num_warps = _pick_block_tok_and_num_warps(head_dim, elements_per_thread)
     if block_tok < 16:
         block_tok = 16
         total_elems = block_tok * head_dim
@@ -884,12 +872,12 @@ def quantized_set_kv_int2_oscar_rotate_k_clip_triton(
     if num_tokens == 0:
         return
 
-    assert head_dim % 4 == 0, (
-        f"head_dim must be divisible by 4 for INT2, got {head_dim}"
-    )
-    assert _is_power_of_two(head_dim), (
-        f"oscar rotate+clip int2 kernel requires power-of-two head_dim, got {head_dim}"
-    )
+    assert (
+        head_dim % 4 == 0
+    ), f"head_dim must be divisible by 4 for INT2, got {head_dim}"
+    assert _is_power_of_two(
+        head_dim
+    ), f"oscar rotate+clip int2 kernel requires power-of-two head_dim, got {head_dim}"
     if R_k.dim() == 3:
         assert R_k.shape == (num_heads, head_dim, head_dim), (
             f"per-head R_k must be [num_heads, head_dim, head_dim]="

@@ -38,7 +38,7 @@ tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 from __future__ import annotations
 
 import logging
-from typing import Collection, TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, Collection, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -277,7 +277,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     group is None
                     or group.state != BeamGroupState.DECODING
                     or group.num_generated > 0
-                    or any(req is c for c in chunked_reqs)  # mid-chunk: no selection yet
+                    or any(
+                        req is c for c in chunked_reqs
+                    )  # mid-chunk: no selection yet
                     or req.is_retracted
                     or req.finished()
                 ):
